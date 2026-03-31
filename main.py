@@ -174,13 +174,12 @@ def is_yolov5_incompatibility(error: Exception) -> bool:
 
 @contextmanager
 def windows_checkpoint_compatibility() -> Any:
+    if os.name != "nt":
+        yield
+        return
+
     original_posix_path = pathlib.PosixPath
-
-    class CompatiblePosixPath(pathlib.PurePosixPath):
-        def __new__(cls, *args: Any, **kwargs: Any) -> pathlib.Path:
-            return pathlib.WindowsPath(*args, **kwargs)
-
-    pathlib.PosixPath = CompatiblePosixPath
+    pathlib.PosixPath = pathlib.WindowsPath
     try:
         yield
     finally:
