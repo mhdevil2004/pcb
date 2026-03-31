@@ -45,6 +45,9 @@ DETECTION_COLUMNS = [
     "y2",
 ]
 MODEL_LOCK = threading.Lock()
+MODEL_STATE_LOCK = threading.Lock()
+MODEL_STATUS = "idle"
+MODEL_ERROR = ""
 
 
 @dataclass
@@ -240,6 +243,34 @@ def load_model() -> ModelBackend:
         return load_with_torch_hub(MODEL_PATH)
 
 
+def set_model_state(status: str, error: str = "") -> None:
+    global MODEL_STATUS, MODEL_ERROR
+    with MODEL_STATE_LOCK:
+        MODEL_STATUS = status
+        MODEL_ERROR = error
+
+
+def get_model_state() -> tuple[str, str]:
+    with MODEL_STATE_LOCK:
+        return MODEL_STATUS, MODEL_ERROR
+
+
+def warm_model() -> None:
+    status, _ = get_model_state()
+    if status in {"loading", "ready"}:
+        return
+
+    def _load() -> None:
+        set_model_state("loading")
+        try:
+            load_model()
+            set_model_state("ready")
+        except Exception as exc:
+            set_model_state("error", str(exc))
+
+    threading.Thread(target=_load, daemon=True).start()
+
+
 def image_to_data_url(image: Image.Image) -> str:
     buffer = BytesIO()
     image.save(buffer, format="PNG")
@@ -335,11 +366,14 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/api/health":
+            model_status, model_error = get_model_state()
             self._send_json(
                 HTTPStatus.OK,
                 {
                     "status": "ok",
                     "model_path": str(MODEL_PATH),
+                    "model_status": model_status,
+                    "model_error": model_error,
                 },
             )
             return
@@ -362,6 +396,16 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            model_status, model_error = get_model_state()
+            if model_status == "loading":
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": "Model is warming up. Please retry in a minute."},
+                )
+                return
+            if model_status == "error":
+                raise RuntimeError(model_error or "Model failed to load.")
+
             backend = load_model()
             form = self._parse_form_data()
             image_item = form["image"] if "image" in form else None
@@ -435,6 +479,7 @@ def clamp_int(value: str, minimum: int, maximum: int, fallback: int) -> int:
 def run_server() -> None:
     host = os.getenv("PCB_BACKEND_HOST", DEFAULT_HOST)
     port = int(os.getenv("PORT", os.getenv("PCB_BACKEND_PORT", str(DEFAULT_PORT))))
+    warm_model()
     server = ThreadingHTTPServer((host, port), PCBRequestHandler)
     print(f"PCB defect backend listening on http://{host}:{port}")
     server.serve_forever()
