@@ -269,8 +269,9 @@ def warm_model() -> None:
     if status in {"loading", "ready"}:
         return
 
+    set_model_state("loading")
+
     def _load() -> None:
-        set_model_state("loading")
         try:
             load_model()
             set_model_state("ready")
@@ -376,6 +377,10 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/api/health":
             model_status, model_error = get_model_state()
+            if model_status == "idle":
+                warm_model()
+                model_status, model_error = get_model_state()
+
             self._send_json(
                 HTTPStatus.OK,
                 {
@@ -488,7 +493,6 @@ def clamp_int(value: str, minimum: int, maximum: int, fallback: int) -> int:
 def run_server() -> None:
     host = os.getenv("PCB_BACKEND_HOST", DEFAULT_HOST)
     port = int(os.getenv("PORT", os.getenv("PCB_BACKEND_PORT", str(DEFAULT_PORT))))
-    warm_model()
     server = ThreadingHTTPServer((host, port), PCBRequestHandler)
     print(f"PCB defect backend listening on http://{host}:{port}")
     server.serve_forever()
