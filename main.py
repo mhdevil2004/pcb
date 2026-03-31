@@ -345,12 +345,11 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/api/classes":
-            backend = load_model()
             self._send_json(
                 HTTPStatus.OK,
                 {
-                    "backend": backend.backend_name,
-                    "classes": list(backend.class_labels.values()),
+                    "backend": "unloaded",
+                    "classes": list(DEFAULT_CLASS_LABELS.values()),
                 },
             )
             return
