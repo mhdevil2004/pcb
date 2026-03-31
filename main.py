@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import importlib
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,13 +14,14 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import pathlib
+import sys
 from pathlib import Path
 import threading
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageDraw
 
 MODEL_PATH = Path(__file__).with_name("pcb_defect_detector.pt")
 LOCAL_YOLOV5_REPO = Path(__file__).with_name("yolov5")
@@ -68,6 +70,8 @@ class ModelBackend:
                 return self._predict_ultralytics(image, confidence, image_size)
             if self.backend_name == "yolov5":
                 return self._predict_yolov5(image, confidence, image_size)
+            if self.backend_name == "yolov5_local":
+                return self._predict_yolov5_local(image, confidence, image_size)
         raise RuntimeError(f"Unsupported backend: {self.backend_name}")
 
     def _predict_ultralytics(
@@ -134,6 +138,58 @@ class ModelBackend:
             annotated_image=Image.fromarray(rendered_images[0]),
         )
 
+    def _predict_yolov5_local(
+        self, image: Image.Image, confidence: float, image_size: int
+    ) -> PredictionOutput:
+        import torch
+
+        letterbox = importlib.import_module("utils.augmentations").letterbox
+        general_utils = importlib.import_module("utils.general")
+        non_max_suppression = general_utils.non_max_suppression
+        scale_boxes = general_utils.scale_boxes
+
+        image_np = np.array(image)
+        stride = int(getattr(self.model, "stride", torch.tensor([32])).max())
+        processed, _, _ = letterbox(image_np, new_shape=image_size, auto=False, stride=stride)
+        processed = np.ascontiguousarray(processed.transpose((2, 0, 1)))
+
+        tensor = torch.from_numpy(processed).to(next(self.model.parameters()).device)
+        tensor = tensor.float() / 255.0
+        if tensor.ndim == 3:
+            tensor = tensor.unsqueeze(0)
+
+        with torch.inference_mode():
+            raw_predictions = self.model(tensor)
+            if isinstance(raw_predictions, (list, tuple)):
+                raw_predictions = raw_predictions[0]
+            predictions = non_max_suppression(
+                raw_predictions,
+                conf_thres=confidence,
+                iou_thres=0.45,
+                max_det=1000,
+            )
+
+        detections_tensor = predictions[0]
+        if detections_tensor is None or len(detections_tensor) == 0:
+            detections = empty_detections()
+        else:
+            detections_tensor[:, :4] = scale_boxes(
+                tensor.shape[2:],
+                detections_tensor[:, :4],
+                image_np.shape,
+            ).round()
+            detections = build_detection_frame(
+                xyxy=detections_tensor[:, :4].cpu().numpy(),
+                confidences=detections_tensor[:, 4].cpu().numpy(),
+                class_ids=detections_tensor[:, 5].cpu().numpy().astype(int),
+                class_labels=self.class_labels,
+            )
+
+        return PredictionOutput(
+            detections=detections,
+            annotated_image=annotate_image(image, detections),
+        )
+
 
 def empty_detections() -> pd.DataFrame:
     return pd.DataFrame(columns=DETECTION_COLUMNS)
@@ -197,6 +253,22 @@ def load_with_ultralytics(model_path: Path) -> ModelBackend:
     return ModelBackend("ultralytics", model, normalize_class_labels(names))
 
 
+def load_with_local_yolov5(model_path: Path) -> ModelBackend:
+    import torch
+
+    repo_path = str(LOCAL_YOLOV5_REPO.resolve())
+    if repo_path not in sys.path:
+        sys.path.insert(0, repo_path)
+
+    attempt_load = importlib.import_module("models.experimental").attempt_load
+
+    with windows_checkpoint_compatibility():
+        model = attempt_load(str(model_path), device=torch.device("cpu"), inplace=True, fuse=True)
+
+    names = getattr(model, "names", None)
+    return ModelBackend("yolov5_local", model, normalize_class_labels(names))
+
+
 def load_with_torch_hub(model_path: Path) -> ModelBackend:
     import torch
 
@@ -244,6 +316,9 @@ def load_model() -> ModelBackend:
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
 
+    if LOCAL_YOLOV5_REPO.exists():
+        return load_with_local_yolov5(MODEL_PATH)
+
     try:
         return load_with_ultralytics(MODEL_PATH)
     except Exception as exc:
@@ -286,6 +361,17 @@ def image_to_data_url(image: Image.Image) -> str:
     image.save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+def annotate_image(image: Image.Image, detections: pd.DataFrame) -> Image.Image:
+    annotated = image.copy()
+    draw = ImageDraw.Draw(annotated)
+    for row in detections.to_dict(orient="records"):
+        box = [row["x1"], row["y1"], row["x2"], row["y2"]]
+        label = f'{row["class_name"]} {row["confidence"]:.2f}'
+        draw.rectangle(box, outline="red", width=3)
+        draw.text((row["x1"] + 4, max(0, row["y1"] - 14)), label, fill="red")
+    return annotated
 
 
 def summarize_detections(detections: pd.DataFrame) -> dict[str, Any]:
