@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from utils.general import LOGGER, check_version, colorstr, file_date, git_describe
+from utils.general import LOGGER, check_version, colorstr, file_date
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv("RANK", -1))
@@ -111,7 +111,7 @@ def device_count():
 
 def select_device(device="", batch_size=0, newline=True):
     """Selects computing device (CPU, CUDA GPU, MPS) for YOLOv5 model deployment, logging device info."""
-    s = f"YOLOv5 🚀 {git_describe() or file_date()} Python-{platform.python_version()} torch-{torch.__version__} "
+    s = f"YOLOv5 🚀 {file_date()} Python-{platform.python_version()} torch-{torch.__version__} "
     device = str(device).strip().lower().replace("cuda:", "").replace("none", "")  # to string, 'cuda:0' to '0'
     cpu = device == "cpu"
     mps = device == "mps"  # Apple Metal Performance Shaders (MPS)

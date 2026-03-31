@@ -200,8 +200,10 @@ def load_with_ultralytics(model_path: Path) -> ModelBackend:
 def load_with_torch_hub(model_path: Path) -> ModelBackend:
     import torch
 
+    previous_autoinstall = os.environ.get("YOLOv5_AUTOINSTALL")
     try:
         with windows_checkpoint_compatibility():
+            os.environ["YOLOv5_AUTOINSTALL"] = "false"
             if LOCAL_YOLOV5_REPO.exists():
                 model = torch.hub.load(
                     str(LOCAL_YOLOV5_REPO),
@@ -209,6 +211,7 @@ def load_with_torch_hub(model_path: Path) -> ModelBackend:
                     path=str(model_path),
                     source="local",
                     force_reload=False,
+                    _verbose=False,
                 )
             else:
                 model = torch.hub.load(
@@ -218,6 +221,7 @@ def load_with_torch_hub(model_path: Path) -> ModelBackend:
                     source="github",
                     force_reload=False,
                     trust_repo=True,
+                    _verbose=False,
                 )
     except Exception as exc:
         raise RuntimeError(
@@ -225,6 +229,11 @@ def load_with_torch_hub(model_path: Path) -> ModelBackend:
             "in this folder or allow `torch.hub` to download `ultralytics/yolov5`.\n\n"
             f"Original error: {exc}"
         ) from exc
+    finally:
+        if previous_autoinstall is None:
+            os.environ.pop("YOLOv5_AUTOINSTALL", None)
+        else:
+            os.environ["YOLOv5_AUTOINSTALL"] = previous_autoinstall
 
     names = getattr(model, "names", None)
     return ModelBackend("yolov5", model, normalize_class_labels(names))
