@@ -30,12 +30,14 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
 SUPPORTED_IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
-MAX_INPUT_PIXELS = int(os.getenv("MAX_INPUT_PIXELS", str(8_000_000)))
-MAX_IMAGE_EDGE = int(os.getenv("MAX_IMAGE_EDGE", "1280"))
-MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "768"))
+MAX_INPUT_PIXELS = int(os.getenv("MAX_INPUT_PIXELS", str(4_000_000)))
+MAX_IMAGE_EDGE = int(os.getenv("MAX_IMAGE_EDGE", "1024"))
+MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "640"))
 PREDICT_CONCURRENCY = int(os.getenv("PREDICT_CONCURRENCY", "1"))
-MAX_DETECTIONS = int(os.getenv("MAX_DETECTIONS", "120"))
+MAX_DETECTIONS = int(os.getenv("MAX_DETECTIONS", "60"))
 ANNOTATION_WIDTH = int(os.getenv("ANNOTATION_WIDTH", "2"))
+MAX_RESPONSE_IMAGE_EDGE = int(os.getenv("MAX_RESPONSE_IMAGE_EDGE", "800"))
+RESPONSE_JPEG_QUALITY = int(os.getenv("RESPONSE_JPEG_QUALITY", "60"))
 DEFAULT_CLASS_LABELS = {
     0: "open",
     1: "short",
@@ -356,15 +358,15 @@ def warm_model() -> None:
 
 
 def image_to_data_url(image: Image.Image) -> str:
-    if max(image.size) > MAX_IMAGE_EDGE:
+    if max(image.size) > MAX_RESPONSE_IMAGE_EDGE:
         preview = image.copy()
-        preview.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE), Image.Resampling.LANCZOS)
+        preview.thumbnail((MAX_RESPONSE_IMAGE_EDGE, MAX_RESPONSE_IMAGE_EDGE), Image.Resampling.LANCZOS)
     else:
         preview = image
 
     buffer = BytesIO()
     # JPEG is much smaller than PNG for photo-like PCB images.
-    preview.save(buffer, format="JPEG", quality=72, optimize=True)
+    preview.save(buffer, format="JPEG", quality=RESPONSE_JPEG_QUALITY, optimize=True)
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     if preview is not image:
         preview.close()
@@ -478,10 +480,6 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
 
         if self.path == "/api/health":
             model_status, model_error = get_model_state()
-            if model_status == "idle":
-                warm_model()
-                model_status, model_error = get_model_state()
-
             self._send_json(
                 HTTPStatus.OK,
                 {
