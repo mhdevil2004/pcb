@@ -21,7 +21,6 @@ import threading
 from typing import Any
 
 import numpy as np
-import pandas as pd
 from PIL import Image, ImageDraw
 
 MODEL_PATH = Path(__file__).with_name("pcb_defect_detector.pt")
@@ -66,7 +65,7 @@ MODEL_ERROR = ""
 
 @dataclass
 class PredictionOutput:
-    detections: pd.DataFrame
+    detections: list[dict[str, Any]]
     annotated_image: Image.Image
 
 
@@ -193,8 +192,8 @@ class ModelBackend:
         )
 
 
-def empty_detections() -> pd.DataFrame:
-    return pd.DataFrame(columns=DETECTION_COLUMNS)
+def empty_detections() -> list[dict[str, Any]]:
+    return []
 
 
 def normalize_class_labels(names: Any) -> dict[int, str]:
@@ -210,22 +209,20 @@ def build_detection_frame(
     confidences: np.ndarray,
     class_ids: np.ndarray,
     class_labels: dict[int, str],
-) -> pd.DataFrame:
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for idx, (box, score, class_id) in enumerate(zip(xyxy, confidences, class_ids), start=1):
-        rows.append(
-            {
-                "detection_id": idx,
-                "class_id": int(class_id),
-                "class_name": class_labels.get(int(class_id), f"class_{class_id}"),
-                "confidence": round(float(score), 4),
-                "x1": round(float(box[0]), 2),
-                "y1": round(float(box[1]), 2),
-                "x2": round(float(box[2]), 2),
-                "y2": round(float(box[3]), 2),
-            }
-        )
-    return pd.DataFrame(rows, columns=DETECTION_COLUMNS)
+        rows.append({
+            "detection_id": idx,
+            "class_id": int(class_id),
+            "class_name": class_labels.get(int(class_id), f"class_{class_id}"),
+            "confidence": round(float(score), 4),
+            "x1": round(float(box[0]), 2),
+            "y1": round(float(box[1]), 2),
+            "x2": round(float(box[2]), 2),
+            "y2": round(float(box[3]), 2),
+        })
+    return rows
 
 
 def is_yolov5_incompatibility(error: Exception) -> bool:
@@ -374,10 +371,10 @@ def image_to_data_url(image: Image.Image) -> str:
     return f"data:image/jpeg;base64,{encoded}"
 
 
-def annotate_image(image: Image.Image, detections: pd.DataFrame) -> Image.Image:
+def annotate_image(image: Image.Image, detections: list[dict[str, Any]]) -> Image.Image:
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated)
-    for row in detections.to_dict(orient="records"):
+    for row in detections:
         box = [row["x1"], row["y1"], row["x2"], row["y2"]]
         label = f'{row["class_name"]} {row["confidence"]:.2f}'
         draw.rectangle(box, outline="red", width=ANNOTATION_WIDTH)
@@ -385,11 +382,11 @@ def annotate_image(image: Image.Image, detections: pd.DataFrame) -> Image.Image:
     return annotated
 
 
-def summarize_detections(detections: pd.DataFrame) -> dict[str, Any]:
-    counts = Counter(detections["class_name"]) if not detections.empty else Counter()
+def summarize_detections(detections: list[dict[str, Any]]) -> dict[str, Any]:
+    counts = Counter(item["class_name"] for item in detections) if detections else Counter()
     sorted_counts = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
     return {
-        "total_defects": int(len(detections)),
+        "total_defects": len(detections),
         "detected_classes": int(len(counts)),
         "most_common": sorted_counts[0][0] if sorted_counts else "No defects",
         "class_counts": [
@@ -461,7 +458,7 @@ def build_prediction_response(
         "backend": backend.backend_name,
         "classes": list(backend.class_labels.values()),
         "summary": summary,
-        "detections": detections.to_dict(orient="records"),
+        "detections": detections,
         "annotated_image": image_to_data_url(prediction.annotated_image),
     }
 
