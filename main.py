@@ -12,7 +12,7 @@ from email.parser import BytesParser
 from email.policy import default as default_email_policy
 from functools import lru_cache
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import pathlib
 import sys
@@ -33,6 +33,9 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
 MAX_INPUT_PIXELS = int(os.getenv("MAX_INPUT_PIXELS", str(8_000_000)))
 MAX_IMAGE_EDGE = int(os.getenv("MAX_IMAGE_EDGE", "1280"))
 MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "768"))
+PREDICT_CONCURRENCY = int(os.getenv("PREDICT_CONCURRENCY", "1"))
+MAX_DETECTIONS = int(os.getenv("MAX_DETECTIONS", "120"))
+ANNOTATION_WIDTH = int(os.getenv("ANNOTATION_WIDTH", "2"))
 DEFAULT_CLASS_LABELS = {
     0: "open",
     1: "short",
@@ -53,6 +56,7 @@ DETECTION_COLUMNS = [
 ]
 MODEL_LOCK = threading.Lock()
 MODEL_STATE_LOCK = threading.Lock()
+PREDICT_SEMAPHORE = threading.BoundedSemaphore(max(1, PREDICT_CONCURRENCY))
 MODEL_STATUS = "idle"
 MODEL_ERROR = ""
 
@@ -87,6 +91,7 @@ class ModelBackend:
             conf=confidence,
             imgsz=image_size,
             verbose=False,
+            max_det=MAX_DETECTIONS,
         )
         result = results[0]
         boxes = result.boxes
@@ -102,7 +107,7 @@ class ModelBackend:
 
         return PredictionOutput(
             detections=detections,
-            annotated_image=Image.fromarray(result.plot()),
+            annotated_image=annotate_image(image, detections),
         )
 
     def _predict_yolov5(
@@ -112,35 +117,24 @@ class ModelBackend:
         self.model.iou = 0.45
         self.model.agnostic = False
         self.model.multi_label = False
-        self.model.max_det = 1000
+        self.model.max_det = MAX_DETECTIONS
 
         results = self.model(np.array(image), size=image_size)
-        frame = results.pandas().xyxy[0].copy()
-        rendered_images = results.render()
-        if frame.empty:
+        raw = results.xyxy[0]
+        if raw is None or len(raw) == 0:
             detections = empty_detections()
         else:
-            frame["class"] = frame["class"].astype(int)
-            detections = pd.DataFrame(
-                {
-                    "detection_id": range(1, len(frame) + 1),
-                    "class_id": frame["class"],
-                    "class_name": [
-                        self.class_labels.get(class_id, str(name))
-                        for class_id, name in zip(frame["class"], frame["name"])
-                    ],
-                    "confidence": frame["confidence"].round(4),
-                    "x1": frame["xmin"].round(2),
-                    "y1": frame["ymin"].round(2),
-                    "x2": frame["xmax"].round(2),
-                    "y2": frame["ymax"].round(2),
-                },
-                columns=DETECTION_COLUMNS,
+            raw_np = raw.cpu().numpy()
+            detections = build_detection_frame(
+                xyxy=raw_np[:, :4],
+                confidences=raw_np[:, 4],
+                class_ids=raw_np[:, 5].astype(int),
+                class_labels=self.class_labels,
             )
 
         return PredictionOutput(
             detections=detections,
-            annotated_image=Image.fromarray(rendered_images[0]),
+            annotated_image=annotate_image(image, detections),
         )
 
     def _predict_yolov5_local(
@@ -171,7 +165,7 @@ class ModelBackend:
                 raw_predictions,
                 conf_thres=confidence,
                 iou_thres=0.45,
-                max_det=1000,
+                max_det=MAX_DETECTIONS,
             )
 
         detections_tensor = predictions[0]
@@ -383,7 +377,7 @@ def annotate_image(image: Image.Image, detections: pd.DataFrame) -> Image.Image:
     for row in detections.to_dict(orient="records"):
         box = [row["x1"], row["y1"], row["x2"], row["y2"]]
         label = f'{row["class_name"]} {row["confidence"]:.2f}'
-        draw.rectangle(box, outline="red", width=3)
+        draw.rectangle(box, outline="red", width=ANNOTATION_WIDTH)
         draw.text((row["x1"] + 4, max(0, row["y1"] - 14)), label, fill="red")
     return annotated
 
@@ -478,6 +472,10 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
+        if self.path == "/":
+            self._send_json(HTTPStatus.OK, {"status": "ok", "service": "pcb-defect-backend"})
+            return
+
         if self.path == "/api/health":
             model_status, model_error = get_model_state()
             if model_status == "idle":
@@ -510,6 +508,13 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path != "/api/predict":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found."})
+            return
+
+        if not PREDICT_SEMAPHORE.acquire(blocking=False):
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "Server is busy with another prediction. Please retry in a few seconds."},
+            )
             return
 
         try:
@@ -547,6 +552,7 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         finally:
             gc.collect()
+            PREDICT_SEMAPHORE.release()
 
     def _parse_form_data(self) -> dict[str, Any]:
         content_length = self.headers.get("Content-Length")
@@ -605,7 +611,7 @@ def clamp_int(value: str, minimum: int, maximum: int, fallback: int) -> int:
 def run_server() -> None:
     host = os.getenv("PCB_BACKEND_HOST", DEFAULT_HOST)
     port = int(os.getenv("PORT", os.getenv("PCB_BACKEND_PORT", str(DEFAULT_PORT))))
-    server = HTTPServer((host, port), PCBRequestHandler)
+    server = ThreadingHTTPServer((host, port), PCBRequestHandler)
     print(f"PCB defect backend listening on http://{host}:{port}")
     server.serve_forever()
 
