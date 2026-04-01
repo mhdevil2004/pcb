@@ -10,3 +10,11 @@ services:
         value: "3.11.0"
       - key: YOLO_CONFIG_DIR
         value: "/tmp/Ultralytics"
+      - key: MAX_UPLOAD_BYTES
+        value: "8388608"
+      - key: MAX_INPUT_PIXELS
+        value: "8000000"
+      - key: MAX_IMAGE_EDGE
+        value: "1280"
+      - key: MAX_IMAGE_SIZE
+        value: "768"
