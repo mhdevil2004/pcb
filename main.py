@@ -554,7 +554,10 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Accept, Origin, X-Requested-With, Authorization",
+        )
 
     def log_message(self, format: str, *args: Any) -> None:
         return
