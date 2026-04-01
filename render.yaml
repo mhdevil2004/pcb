@@ -13,10 +13,16 @@ services:
       - key: MAX_UPLOAD_BYTES
         value: "8388608"
       - key: MAX_INPUT_PIXELS
-        value: "8000000"
+        value: "4000000"
       - key: MAX_IMAGE_EDGE
-        value: "1280"
+        value: "1024"
       - key: MAX_IMAGE_SIZE
-        value: "768"
+        value: "640"
       - key: PREDICT_CONCURRENCY
         value: "1"
+      - key: MAX_DETECTIONS
+        value: "60"
+      - key: MAX_RESPONSE_IMAGE_EDGE
+        value: "800"
+      - key: RESPONSE_JPEG_QUALITY
+        value: "60"
