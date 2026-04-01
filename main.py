@@ -34,6 +34,7 @@ MAX_INPUT_PIXELS = int(os.getenv("MAX_INPUT_PIXELS", str(4_000_000)))
 MAX_IMAGE_EDGE = int(os.getenv("MAX_IMAGE_EDGE", "1024"))
 MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "640"))
 PREDICT_CONCURRENCY = int(os.getenv("PREDICT_CONCURRENCY", "1"))
+PREDICT_ACQUIRE_TIMEOUT_SEC = float(os.getenv("PREDICT_ACQUIRE_TIMEOUT_SEC", "20"))
 MAX_DETECTIONS = int(os.getenv("MAX_DETECTIONS", "60"))
 ANNOTATION_WIDTH = int(os.getenv("ANNOTATION_WIDTH", "2"))
 MAX_RESPONSE_IMAGE_EDGE = int(os.getenv("MAX_RESPONSE_IMAGE_EDGE", "800"))
@@ -508,7 +509,7 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found."})
             return
 
-        if not PREDICT_SEMAPHORE.acquire(blocking=False):
+        if not PREDICT_SEMAPHORE.acquire(timeout=PREDICT_ACQUIRE_TIMEOUT_SEC):
             self._send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": "Server is busy with another prediction. Please retry in a few seconds."},
@@ -525,6 +526,13 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
                 return
             if model_status == "error":
                 raise RuntimeError(model_error or "Model failed to load.")
+            if model_status == "idle":
+                warm_model()
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": "Model is warming up. Please retry in a minute."},
+                )
+                return
 
             backend = load_model()
             form = self._parse_form_data()
