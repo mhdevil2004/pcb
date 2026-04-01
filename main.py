@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gc
 import json
 import os
 import importlib
@@ -11,7 +12,7 @@ from email.parser import BytesParser
 from email.policy import default as default_email_policy
 from functools import lru_cache
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 import pathlib
 import sys
@@ -28,6 +29,10 @@ LOCAL_YOLOV5_REPO = Path(__file__).with_name("yolov5")
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
 SUPPORTED_IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
+MAX_INPUT_PIXELS = int(os.getenv("MAX_INPUT_PIXELS", str(8_000_000)))
+MAX_IMAGE_EDGE = int(os.getenv("MAX_IMAGE_EDGE", "1280"))
+MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "768"))
 DEFAULT_CLASS_LABELS = {
     0: "open",
     1: "short",
@@ -357,10 +362,19 @@ def warm_model() -> None:
 
 
 def image_to_data_url(image: Image.Image) -> str:
+    if max(image.size) > MAX_IMAGE_EDGE:
+        preview = image.copy()
+        preview.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE), Image.Resampling.LANCZOS)
+    else:
+        preview = image
+
     buffer = BytesIO()
-    image.save(buffer, format="PNG")
+    # JPEG is much smaller than PNG for photo-like PCB images.
+    preview.save(buffer, format="JPEG", quality=72, optimize=True)
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
+    if preview is not image:
+        preview.close()
+    return f"data:image/jpeg;base64,{encoded}"
 
 
 def annotate_image(image: Image.Image, detections: pd.DataFrame) -> Image.Image:
@@ -400,7 +414,10 @@ def parse_uploaded_image(file_item: dict[str, Any]) -> Image.Image:
     if not raw_bytes:
         raise ValueError("Uploaded file is empty.")
 
-    return Image.open(BytesIO(raw_bytes)).convert("RGB")
+    image = Image.open(BytesIO(raw_bytes)).convert("RGB")
+    if image.width * image.height > MAX_INPUT_PIXELS or max(image.size) > MAX_IMAGE_EDGE:
+        image.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE), Image.Resampling.LANCZOS)
+    return image
 
 
 def parse_multipart_form_data(headers: Any, body: bytes) -> dict[str, Any]:
@@ -513,7 +530,7 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
                 raise ValueError("Missing `image` field in form data.")
 
             confidence = clamp_float(str(form.get("confidence", "0.25")), 0.05, 0.95, 0.25)
-            image_size = clamp_int(str(form.get("image_size", "640")), 320, 1280, 640)
+            image_size = clamp_int(str(form.get("image_size", "640")), 320, MAX_IMAGE_SIZE, 640)
             image = parse_uploaded_image(image_item)
             payload = build_prediction_response(
                 backend=backend,
@@ -528,6 +545,8 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         except Exception as exc:
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+        finally:
+            gc.collect()
 
     def _parse_form_data(self) -> dict[str, Any]:
         content_length = self.headers.get("Content-Length")
@@ -538,6 +557,10 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             length = int(content_length)
         except ValueError as exc:
             raise ValueError("Invalid Content-Length header.") from exc
+        if length > MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"Uploaded file is too large ({length} bytes). Limit is {MAX_UPLOAD_BYTES} bytes."
+            )
 
         body = self.rfile.read(length)
         return parse_multipart_form_data(self.headers, body)
@@ -582,7 +605,7 @@ def clamp_int(value: str, minimum: int, maximum: int, fallback: int) -> int:
 def run_server() -> None:
     host = os.getenv("PCB_BACKEND_HOST", DEFAULT_HOST)
     port = int(os.getenv("PORT", os.getenv("PCB_BACKEND_PORT", str(DEFAULT_PORT))))
-    server = ThreadingHTTPServer((host, port), PCBRequestHandler)
+    server = HTTPServer((host, port), PCBRequestHandler)
     print(f"PCB defect backend listening on http://{host}:{port}")
     server.serve_forever()
 
