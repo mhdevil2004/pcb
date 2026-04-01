@@ -18,3 +18,5 @@ services:
         value: "1280"
       - key: MAX_IMAGE_SIZE
         value: "768"
+      - key: PREDICT_CONCURRENCY
+        value: "1"
