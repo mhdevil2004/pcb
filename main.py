@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import argparse
 import base64
 import gc
 import json
 import os
 import importlib
 import socket
+import subprocess
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import pathlib
 import sys
+import tempfile
 from pathlib import Path
 import threading
 from typing import Any
@@ -48,6 +51,12 @@ MODEL_WARM_ON_STARTUP = os.getenv("MODEL_WARM_ON_STARTUP", "false").strip().lowe
     "no",
 }
 MODEL_KEEPALIVE_SEC = float(os.getenv("MODEL_KEEPALIVE_SEC", "0"))
+PREDICT_IN_SUBPROCESS = os.getenv("PREDICT_IN_SUBPROCESS", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+PREDICT_SUBPROCESS_TIMEOUT_SEC = float(os.getenv("PREDICT_SUBPROCESS_TIMEOUT_SEC", "240"))
 DEFAULT_CLASS_LABELS = {
     0: "open",
     1: "short",
@@ -472,6 +481,25 @@ def parse_uploaded_image(file_item: dict[str, Any]) -> Image.Image:
     return image
 
 
+def validate_uploaded_file(file_item: dict[str, Any]) -> tuple[str, bytes]:
+    if not file_item["content"]:
+        raise ValueError("No image file was uploaded.")
+
+    filename = file_item["filename"] or "upload"
+    extension = Path(filename).suffix.lower()
+    if extension and extension not in SUPPORTED_IMAGE_TYPES:
+        raise ValueError("Unsupported image type. Use jpg, jpeg, png, bmp, or webp.")
+
+    raw_bytes = file_item["content"]
+    if not raw_bytes:
+        raise ValueError("Uploaded file is empty.")
+    if len(raw_bytes) > MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"Uploaded file is too large ({len(raw_bytes)} bytes). Limit is {MAX_UPLOAD_BYTES} bytes."
+        )
+    return filename, raw_bytes
+
+
 def parse_multipart_form_data(headers: Any, body: bytes) -> dict[str, Any]:
     content_type = headers.get("Content-Type", "")
     if "multipart/form-data" not in content_type:
@@ -524,6 +552,91 @@ def build_prediction_response(
         prediction.annotated_image.close()
 
 
+def predict_once_from_upload(file_item: dict[str, Any], confidence: float, image_size: int) -> dict[str, Any]:
+    image = parse_uploaded_image(file_item)
+    try:
+        backend = load_model()
+        return build_prediction_response(
+            backend=backend,
+            image=image,
+            confidence=confidence,
+            image_size=image_size,
+        )
+    finally:
+        image.close()
+
+
+def predict_via_subprocess(
+    file_item: dict[str, Any],
+    confidence: float,
+    image_size: int,
+) -> dict[str, Any]:
+    filename, raw_bytes = validate_uploaded_file(file_item)
+    suffix = Path(filename).suffix or ".img"
+
+    with tempfile.TemporaryDirectory(prefix="pcb-predict-") as temp_dir:
+        temp_dir_path = Path(temp_dir)
+        input_path = temp_dir_path / f"input{suffix}"
+        output_path = temp_dir_path / "result.json"
+        input_path.write_bytes(raw_bytes)
+
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--predict-once",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--confidence",
+            str(confidence),
+            "--image-size",
+            str(image_size),
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=PREDICT_SUBPROCESS_TIMEOUT_SEC,
+            check=False,
+        )
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "").strip()
+            if not message:
+                message = f"Prediction worker exited with code {result.returncode}."
+            raise RuntimeError(message)
+        if not output_path.exists():
+            raise RuntimeError("Prediction worker did not produce an output payload.")
+
+        try:
+            return json.loads(output_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Prediction worker returned invalid JSON.") from exc
+
+
+def run_prediction_worker(
+    input_path: str,
+    output_path: str,
+    confidence: float,
+    image_size: int,
+) -> int:
+    source_path = Path(input_path)
+    if not source_path.exists():
+        raise FileNotFoundError(f"Prediction input file not found: {source_path}")
+
+    payload = predict_once_from_upload(
+        {
+            "filename": source_path.name,
+            "content": source_path.read_bytes(),
+        },
+        confidence=confidence,
+        image_size=image_size,
+    )
+    Path(output_path).write_text(json.dumps(payload), encoding="utf-8")
+    gc.collect()
+    return 0
+
+
 class PCBRequestHandler(BaseHTTPRequestHandler):
     server_version = "PCBDefectServer/1.0"
     protocol_version = "HTTP/1.1"
@@ -562,6 +675,7 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
                     "model_status": model_status,
                     "model_error": model_error,
                     "ready": model_status == "ready",
+                    "prediction_mode": "subprocess" if PREDICT_IN_SUBPROCESS else "in_process",
                     "memory": get_memory_stats(),
                 },
             )
@@ -593,24 +707,6 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            model_status, model_error = get_model_state()
-            if model_status == "loading":
-                self._send_json(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    {"error": "Model is warming up. Please retry in a minute."},
-                )
-                return
-            if model_status == "error":
-                raise RuntimeError(model_error or "Model failed to load.")
-            if model_status == "idle":
-                warm_model()
-                self._send_json(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    {"error": "Model is warming up. Please retry in a minute."},
-                )
-                return
-
-            backend = load_model()
             form = self._parse_form_data()
             image_item = form["image"] if "image" in form else None
             if image_item is None:
@@ -618,24 +714,43 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
 
             confidence = clamp_float(str(form.get("confidence", "0.25")), 0.05, 0.95, 0.25)
             image_size = clamp_int(str(form.get("image_size", "640")), 320, MAX_IMAGE_SIZE, 640)
-            image = parse_uploaded_image(image_item)
-            try:
-                payload = build_prediction_response(
-                    backend=backend,
-                    image=image,
+            if PREDICT_IN_SUBPROCESS:
+                payload = predict_via_subprocess(
+                    file_item=image_item,
                     confidence=confidence,
                     image_size=image_size,
                 )
-            finally:
-                image.close()
-            schedule_model_unload()
+            else:
+                model_status, model_error = get_model_state()
+                if model_status == "loading":
+                    self._send_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": "Model is warming up. Please retry in a minute."},
+                    )
+                    return
+                if model_status == "error":
+                    raise RuntimeError(model_error or "Model failed to load.")
+                if model_status == "idle":
+                    warm_model()
+                    self._send_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": "Model is warming up. Please retry in a minute."},
+                    )
+                    return
+                payload = predict_once_from_upload(
+                    file_item=image_item,
+                    confidence=confidence,
+                    image_size=image_size,
+                )
+                schedule_model_unload()
             self._send_json(HTTPStatus.OK, payload)
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except FileNotFoundError as exc:
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         except Exception as exc:
-            schedule_model_unload()
+            if not PREDICT_IN_SUBPROCESS:
+                schedule_model_unload()
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         finally:
             gc.collect()
@@ -715,12 +830,34 @@ def clamp_int(value: str, minimum: int, maximum: int, fallback: int) -> int:
 def run_server() -> None:
     host = os.getenv("PCB_BACKEND_HOST", DEFAULT_HOST)
     port = int(os.getenv("PORT", os.getenv("PCB_BACKEND_PORT", str(DEFAULT_PORT))))
-    if MODEL_WARM_ON_STARTUP:
+    if MODEL_WARM_ON_STARTUP and not PREDICT_IN_SUBPROCESS:
         warm_model()
     server = RenderReadyThreadingHTTPServer((host, port), PCBRequestHandler)
     print(f"PCB defect backend listening on http://{host}:{port}")
     server.serve_forever()
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="PCB defect backend")
+    parser.add_argument("--predict-once", action="store_true")
+    parser.add_argument("--input")
+    parser.add_argument("--output")
+    parser.add_argument("--confidence", type=float, default=0.25)
+    parser.add_argument("--image-size", type=int, default=640)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    if args.predict_once:
+        if not args.input or not args.output:
+            raise SystemExit("--predict-once requires --input and --output")
+        raise SystemExit(
+            run_prediction_worker(
+                input_path=args.input,
+                output_path=args.output,
+                confidence=clamp_float(str(args.confidence), 0.05, 0.95, 0.25),
+                image_size=clamp_int(str(args.image_size), 320, MAX_IMAGE_SIZE, 640),
+            )
+        )
     run_server()
