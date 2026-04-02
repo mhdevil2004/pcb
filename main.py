@@ -99,6 +99,7 @@ class PredictionWorkerHandle:
     process: subprocess.Popen[str]
     messages: queue.Queue[dict[str, Any]]
     stderr_lines: list[str]
+    is_ready: bool = False
 
 
 def get_memory_stats() -> dict[str, int]:
@@ -129,6 +130,24 @@ def _worker_stderr_reader(stream: Any, stderr_lines: list[str]) -> None:
     for raw_line in iter(stream.readline, ""):
         stderr_lines.append(raw_line.rstrip())
     stream.close()
+
+
+def _stop_prediction_worker_handle(handle: PredictionWorkerHandle) -> None:
+    process = handle.process
+    try:
+        if process.poll() is None and process.stdin is not None:
+            process.stdin.write(json.dumps({"action": "shutdown"}) + "\n")
+            process.stdin.flush()
+    except Exception:
+        pass
+
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
 
 class ModelBackend:
@@ -429,22 +448,7 @@ def stop_prediction_worker() -> None:
     if handle is None:
         return
 
-    process = handle.process
-    try:
-        if process.poll() is None and process.stdin is not None:
-            process.stdin.write(json.dumps({"action": "shutdown"}) + "\n")
-            process.stdin.flush()
-    except Exception:
-        pass
-
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
-
+    _stop_prediction_worker_handle(handle)
     set_model_state("idle")
 
 
@@ -462,65 +466,82 @@ def schedule_prediction_worker_shutdown() -> None:
         timer.start()
 
 
+def wait_for_prediction_worker_ready(
+    handle: PredictionWorkerHandle,
+    timeout_sec: float,
+) -> PredictionWorkerHandle:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        remaining = max(0.1, deadline - time.monotonic())
+        if handle.process.poll() is not None:
+            stderr_output = _collect_worker_stderr(handle)
+            raise RuntimeError(stderr_output or "Prediction worker exited before becoming ready.")
+        try:
+            message = handle.messages.get(timeout=min(1.0, remaining))
+        except queue.Empty:
+            continue
+
+        message_type = message.get("type")
+        if message_type == "ready":
+            handle.is_ready = True
+            set_model_state("ready")
+            return handle
+        if message_type == "error":
+            raise RuntimeError(str(message.get("error") or "Prediction worker failed to start."))
+
+    raise RuntimeError("Prediction worker startup timed out.")
+
+
 def ensure_prediction_worker_loaded(timeout_sec: float | None = None) -> PredictionWorkerHandle:
     global PREDICTION_WORKER
 
     timeout = timeout_sec if timeout_sec is not None else PREDICT_SUBPROCESS_TIMEOUT_SEC
     with PREDICTION_WORKER_LOCK:
         if PREDICTION_WORKER is not None and PREDICTION_WORKER.process.poll() is None:
-            return PREDICTION_WORKER
+            handle = PREDICTION_WORKER
+        else:
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--worker-serve",
+            ]
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            handle = PredictionWorkerHandle(process=process, messages=queue.Queue(), stderr_lines=[])
+            assert process.stdout is not None
+            assert process.stderr is not None
+            threading.Thread(
+                target=_worker_stdout_reader,
+                args=(process.stdout, handle.messages),
+                daemon=True,
+                name="prediction-worker-stdout",
+            ).start()
+            threading.Thread(
+                target=_worker_stderr_reader,
+                args=(process.stderr, handle.stderr_lines),
+                daemon=True,
+                name="prediction-worker-stderr",
+            ).start()
+            PREDICTION_WORKER = handle
 
-        command = [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            "--worker-serve",
-        ]
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        handle = PredictionWorkerHandle(process=process, messages=queue.Queue(), stderr_lines=[])
-        assert process.stdout is not None
-        assert process.stderr is not None
-        threading.Thread(
-            target=_worker_stdout_reader,
-            args=(process.stdout, handle.messages),
-            daemon=True,
-            name="prediction-worker-stdout",
-        ).start()
-        threading.Thread(
-            target=_worker_stderr_reader,
-            args=(process.stderr, handle.stderr_lines),
-            daemon=True,
-            name="prediction-worker-stderr",
-        ).start()
-        PREDICTION_WORKER = handle
+    if handle.is_ready:
+        return handle
 
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        remaining = max(0.1, deadline - time.monotonic())
-        if handle.process.poll() is not None:
-            stderr_output = _collect_worker_stderr(handle)
-            stop_prediction_worker()
-            raise RuntimeError(stderr_output or "Prediction worker exited before becoming ready.")
-        try:
-            message = handle.messages.get(timeout=min(1.0, remaining))
-        except queue.Empty:
-            continue
-        message_type = message.get("type")
-        if message_type == "ready":
-            set_model_state("ready")
-            return handle
-        if message_type == "error":
-            stop_prediction_worker()
-            raise RuntimeError(str(message.get("error") or "Prediction worker failed to start."))
-
-    stop_prediction_worker()
-    raise RuntimeError("Prediction worker startup timed out.")
+    try:
+        return wait_for_prediction_worker_ready(handle, timeout)
+    except Exception:
+        with PREDICTION_WORKER_LOCK:
+            if PREDICTION_WORKER is handle:
+                PREDICTION_WORKER = None
+        _stop_prediction_worker_handle(handle)
+        set_model_state("error", _collect_worker_stderr(handle) or "Prediction worker failed to start.")
+        raise
 
 
 def warm_prediction_worker_async() -> None:
@@ -741,48 +762,60 @@ def predict_via_subprocess(
         if process.stdin is None:
             raise RuntimeError("Prediction worker input stream is unavailable.")
 
-        with PREDICTION_WORKER_LOCK:
-            process.stdin.write(
-                json.dumps(
-                    {
-                        "action": "predict",
-                        "input_path": str(input_path),
-                        "output_path": str(output_path),
-                        "confidence": confidence,
-                        "image_size": image_size,
-                    }
+        try:
+            with PREDICTION_WORKER_LOCK:
+                process.stdin.write(
+                    json.dumps(
+                        {
+                            "action": "predict",
+                            "input_path": str(input_path),
+                            "output_path": str(output_path),
+                            "confidence": confidence,
+                            "image_size": image_size,
+                        }
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
-            process.stdin.flush()
+                process.stdin.flush()
 
-            deadline = time.monotonic() + PREDICT_SUBPROCESS_TIMEOUT_SEC
-            while time.monotonic() < deadline:
-                remaining = max(0.1, deadline - time.monotonic())
-                if process.poll() is not None:
-                    stderr_output = _collect_worker_stderr(handle)
-                    stop_prediction_worker()
-                    raise RuntimeError(stderr_output or "Prediction worker exited unexpectedly.")
-                try:
-                    message = handle.messages.get(timeout=min(1.0, remaining))
-                except queue.Empty:
-                    continue
-
-                message_type = message.get("type")
-                if message_type == "result":
-                    if not bool(message.get("ok")):
-                        raise RuntimeError(str(message.get("error") or "Prediction worker failed."))
-                    if not output_path.exists():
-                        raise RuntimeError("Prediction worker did not produce an output payload.")
-                    schedule_prediction_worker_shutdown()
+                deadline = time.monotonic() + PREDICT_SUBPROCESS_TIMEOUT_SEC
+                while time.monotonic() < deadline:
+                    remaining = max(0.1, deadline - time.monotonic())
+                    if process.poll() is not None:
+                        stderr_output = _collect_worker_stderr(handle)
+                        raise RuntimeError(stderr_output or "Prediction worker exited unexpectedly.")
                     try:
-                        return json.loads(output_path.read_text(encoding="utf-8"))
-                    except json.JSONDecodeError as exc:
-                        raise RuntimeError("Prediction worker returned invalid JSON.") from exc
-                if message_type == "error":
-                    raise RuntimeError(str(message.get("error") or "Prediction worker failed."))
+                        message = handle.messages.get(timeout=min(1.0, remaining))
+                    except queue.Empty:
+                        continue
 
-        stop_prediction_worker()
+                    message_type = message.get("type")
+                    if message_type == "result":
+                        if not bool(message.get("ok")):
+                            raise RuntimeError(str(message.get("error") or "Prediction worker failed."))
+                        if not output_path.exists():
+                            raise RuntimeError("Prediction worker did not produce an output payload.")
+                        schedule_prediction_worker_shutdown()
+                        try:
+                            return json.loads(output_path.read_text(encoding="utf-8"))
+                        except json.JSONDecodeError as exc:
+                            raise RuntimeError("Prediction worker returned invalid JSON.") from exc
+                    if message_type == "error":
+                        raise RuntimeError(str(message.get("error") or "Prediction worker failed."))
+        except Exception as exc:
+            with PREDICTION_WORKER_LOCK:
+                if PREDICTION_WORKER is handle:
+                    PREDICTION_WORKER = None
+            _stop_prediction_worker_handle(handle)
+            stderr_output = _collect_worker_stderr(handle)
+            set_model_state("error", stderr_output or str(exc))
+            raise
+
+        with PREDICTION_WORKER_LOCK:
+            if PREDICTION_WORKER is handle:
+                PREDICTION_WORKER = None
+        _stop_prediction_worker_handle(handle)
+        set_model_state("error", "Prediction worker timed out while processing the request.")
         raise RuntimeError("Prediction worker timed out while processing the request.")
 
 
