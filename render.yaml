@@ -12,7 +12,7 @@ services:
       - key: MODEL_WARM_ON_STARTUP
         value: "false"
       - key: MODEL_KEEPALIVE_SEC
-        value: "0"
+        value: "180"
       - key: PREDICT_IN_SUBPROCESS
         value: "true"
       - key: PREDICT_SUBPROCESS_TIMEOUT_SEC
