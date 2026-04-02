@@ -14,11 +14,13 @@ services:
       - key: MODEL_KEEPALIVE_SEC
         value: "180"
       - key: PREDICT_IN_SUBPROCESS
-        value: "true"
+        value: "false"
       - key: PREDICT_SUBPROCESS_TIMEOUT_SEC
         value: "480"
       - key: SERVER_REQUEST_TIMEOUT_SEC
-        value: "30"
+        value: "300"
+      - key: MODEL_READY_TIMEOUT_SEC
+        value: "240"
       - key: YOLO_CONFIG_DIR
         value: "/tmp/Ultralytics"
       - key: MAX_UPLOAD_BYTES
