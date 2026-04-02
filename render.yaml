@@ -4,10 +4,15 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: python -u main.py
+    healthCheckPath: /api/health
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.0"
+      - key: MODEL_WARM_ON_STARTUP
+        value: "true"
+      - key: SERVER_REQUEST_TIMEOUT_SEC
+        value: "30"
       - key: YOLO_CONFIG_DIR
         value: "/tmp/Ultralytics"
       - key: MAX_UPLOAD_BYTES
