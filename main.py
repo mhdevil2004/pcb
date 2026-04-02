@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 from PIL import Image, ImageDraw
+import psutil
 
 MODEL_PATH = Path(__file__).with_name("pcb_defect_detector.pt")
 LOCAL_YOLOV5_REPO = Path(__file__).with_name("yolov5")
@@ -41,11 +42,12 @@ ANNOTATION_WIDTH = int(os.getenv("ANNOTATION_WIDTH", "2"))
 MAX_RESPONSE_IMAGE_EDGE = int(os.getenv("MAX_RESPONSE_IMAGE_EDGE", "800"))
 RESPONSE_JPEG_QUALITY = int(os.getenv("RESPONSE_JPEG_QUALITY", "60"))
 SERVER_REQUEST_TIMEOUT_SEC = float(os.getenv("SERVER_REQUEST_TIMEOUT_SEC", "30"))
-MODEL_WARM_ON_STARTUP = os.getenv("MODEL_WARM_ON_STARTUP", "true").strip().lower() not in {
+MODEL_WARM_ON_STARTUP = os.getenv("MODEL_WARM_ON_STARTUP", "false").strip().lower() not in {
     "0",
     "false",
     "no",
 }
+MODEL_KEEPALIVE_SEC = float(os.getenv("MODEL_KEEPALIVE_SEC", "0"))
 DEFAULT_CLASS_LABELS = {
     0: "open",
     1: "short",
@@ -70,12 +72,21 @@ PREDICT_SEMAPHORE = threading.BoundedSemaphore(max(1, PREDICT_CONCURRENCY))
 MODEL_STATUS = "idle"
 MODEL_ERROR = ""
 MODEL_WARM_THREAD: threading.Thread | None = None
+MODEL_UNLOAD_TIMER: threading.Timer | None = None
 
 
 @dataclass
 class PredictionOutput:
     detections: list[dict[str, Any]]
     annotated_image: Image.Image
+
+
+def get_memory_stats() -> dict[str, int]:
+    memory_info = psutil.Process(os.getpid()).memory_info()
+    return {
+        "rss_mb": int(memory_info.rss / (1024 * 1024)),
+        "vms_mb": int(memory_info.vms / (1024 * 1024)),
+    }
 
 
 class ModelBackend:
@@ -335,6 +346,37 @@ def load_model() -> ModelBackend:
         return load_with_torch_hub(MODEL_PATH)
 
 
+def unload_model() -> None:
+    global MODEL_UNLOAD_TIMER, MODEL_STATUS, MODEL_ERROR
+
+    with MODEL_STATE_LOCK:
+        if MODEL_UNLOAD_TIMER is not None:
+            MODEL_UNLOAD_TIMER.cancel()
+            MODEL_UNLOAD_TIMER = None
+        load_model.cache_clear()
+        MODEL_STATUS = "idle"
+        MODEL_ERROR = ""
+
+    gc.collect()
+
+
+def schedule_model_unload() -> None:
+    global MODEL_UNLOAD_TIMER
+
+    if MODEL_KEEPALIVE_SEC < 0:
+        return
+
+    with MODEL_STATE_LOCK:
+        if MODEL_UNLOAD_TIMER is not None:
+            MODEL_UNLOAD_TIMER.cancel()
+            MODEL_UNLOAD_TIMER = None
+
+        timer = threading.Timer(MODEL_KEEPALIVE_SEC, unload_model)
+        timer.daemon = True
+        MODEL_UNLOAD_TIMER = timer
+        timer.start()
+
+
 def set_model_state(status: str, error: str = "") -> None:
     global MODEL_STATUS, MODEL_ERROR
     with MODEL_STATE_LOCK:
@@ -362,6 +404,7 @@ def warm_model() -> None:
             set_model_state("ready")
         except Exception as exc:
             set_model_state("error", str(exc))
+            gc.collect()
 
     MODEL_WARM_THREAD = threading.Thread(target=_load, name="model-warmup", daemon=True)
     MODEL_WARM_THREAD.start()
@@ -378,6 +421,7 @@ def image_to_data_url(image: Image.Image) -> str:
     # JPEG is much smaller than PNG for photo-like PCB images.
     preview.save(buffer, format="JPEG", quality=RESPONSE_JPEG_QUALITY, optimize=True)
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    buffer.close()
     if preview is not image:
         preview.close()
     return f"data:image/jpeg;base64,{encoded}"
@@ -465,16 +509,19 @@ def build_prediction_response(
     image_size: int,
 ) -> dict[str, Any]:
     prediction = backend.predict(image=image, confidence=confidence, image_size=image_size)
-    detections = prediction.detections
-    summary = summarize_detections(detections)
+    try:
+        detections = prediction.detections
+        summary = summarize_detections(detections)
 
-    return {
-        "backend": backend.backend_name,
-        "classes": list(backend.class_labels.values()),
-        "summary": summary,
-        "detections": detections,
-        "annotated_image": image_to_data_url(prediction.annotated_image),
-    }
+        return {
+            "backend": backend.backend_name,
+            "classes": list(backend.class_labels.values()),
+            "summary": summary,
+            "detections": detections,
+            "annotated_image": image_to_data_url(prediction.annotated_image),
+        }
+    finally:
+        prediction.annotated_image.close()
 
 
 class PCBRequestHandler(BaseHTTPRequestHandler):
@@ -501,12 +548,10 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.request_path == "/":
-            self._ensure_model_warm()
             self._send_json(HTTPStatus.OK, {"status": "ok", "service": "pcb-defect-backend"})
             return
 
         if self.request_path == "/api/health":
-            self._ensure_model_warm()
             model_status, model_error = get_model_state()
             self._send_json(
                 HTTPStatus.OK,
@@ -517,12 +562,12 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
                     "model_status": model_status,
                     "model_error": model_error,
                     "ready": model_status == "ready",
+                    "memory": get_memory_stats(),
                 },
             )
             return
 
         if self.request_path == "/api/classes":
-            self._ensure_model_warm()
             self._send_json(
                 HTTPStatus.OK,
                 {
@@ -583,12 +628,14 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
                 )
             finally:
                 image.close()
+            schedule_model_unload()
             self._send_json(HTTPStatus.OK, payload)
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except FileNotFoundError as exc:
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         except Exception as exc:
+            schedule_model_unload()
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         finally:
             gc.collect()
@@ -638,11 +685,6 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             "Access-Control-Allow-Headers",
             "Content-Type, Accept, Origin, X-Requested-With, Authorization",
         )
-
-    def _ensure_model_warm(self) -> None:
-        status, _ = get_model_state()
-        if status == "idle":
-            warm_model()
 
     def log_message(self, format: str, *args: Any) -> None:
         return
