@@ -16,7 +16,7 @@ services:
       - key: PREDICT_IN_SUBPROCESS
         value: "true"
       - key: PREDICT_SUBPROCESS_TIMEOUT_SEC
-        value: "240"
+        value: "480"
       - key: SERVER_REQUEST_TIMEOUT_SEC
         value: "30"
       - key: YOLO_CONFIG_DIR
