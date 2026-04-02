@@ -10,7 +10,9 @@ services:
       - key: PYTHON_VERSION
         value: "3.11.0"
       - key: MODEL_WARM_ON_STARTUP
-        value: "true"
+        value: "false"
+      - key: MODEL_KEEPALIVE_SEC
+        value: "0"
       - key: SERVER_REQUEST_TIMEOUT_SEC
         value: "30"
       - key: YOLO_CONFIG_DIR
@@ -20,14 +22,14 @@ services:
       - key: MAX_INPUT_PIXELS
         value: "4000000"
       - key: MAX_IMAGE_EDGE
-        value: "1024"
+        value: "768"
       - key: MAX_IMAGE_SIZE
-        value: "640"
+        value: "512"
       - key: PREDICT_CONCURRENCY
         value: "1"
       - key: MAX_DETECTIONS
         value: "60"
       - key: MAX_RESPONSE_IMAGE_EDGE
-        value: "800"
+        value: "640"
       - key: RESPONSE_JPEG_QUALITY
-        value: "60"
+        value: "50"
