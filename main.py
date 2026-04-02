@@ -18,10 +18,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import pathlib
+import queue
 import sys
 import tempfile
 from pathlib import Path
 import threading
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -82,6 +84,8 @@ MODEL_STATUS = "idle"
 MODEL_ERROR = ""
 MODEL_WARM_THREAD: threading.Thread | None = None
 MODEL_UNLOAD_TIMER: threading.Timer | None = None
+PREDICTION_WORKER_LOCK = threading.Lock()
+PREDICTION_WORKER: PredictionWorkerHandle | None = None
 
 
 @dataclass
@@ -90,12 +94,41 @@ class PredictionOutput:
     annotated_image: Image.Image
 
 
+@dataclass
+class PredictionWorkerHandle:
+    process: subprocess.Popen[str]
+    messages: queue.Queue[dict[str, Any]]
+    stderr_lines: list[str]
+
+
 def get_memory_stats() -> dict[str, int]:
     memory_info = psutil.Process(os.getpid()).memory_info()
     return {
         "rss_mb": int(memory_info.rss / (1024 * 1024)),
         "vms_mb": int(memory_info.vms / (1024 * 1024)),
     }
+
+
+def _collect_worker_stderr(handle: PredictionWorkerHandle) -> str:
+    return "\n".join(line.strip() for line in handle.stderr_lines if line.strip())
+
+
+def _worker_stdout_reader(stream: Any, messages: queue.Queue[dict[str, Any]]) -> None:
+    for raw_line in iter(stream.readline, ""):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            messages.put(json.loads(line))
+        except json.JSONDecodeError:
+            messages.put({"type": "log", "message": line})
+    stream.close()
+
+
+def _worker_stderr_reader(stream: Any, stderr_lines: list[str]) -> None:
+    for raw_line in iter(stream.readline, ""):
+        stderr_lines.append(raw_line.rstrip())
+    stream.close()
 
 
 class ModelBackend:
@@ -386,6 +419,130 @@ def schedule_model_unload() -> None:
         timer.start()
 
 
+def stop_prediction_worker() -> None:
+    global PREDICTION_WORKER
+
+    with PREDICTION_WORKER_LOCK:
+        handle = PREDICTION_WORKER
+        PREDICTION_WORKER = None
+
+    if handle is None:
+        return
+
+    process = handle.process
+    try:
+        if process.poll() is None and process.stdin is not None:
+            process.stdin.write(json.dumps({"action": "shutdown"}) + "\n")
+            process.stdin.flush()
+    except Exception:
+        pass
+
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    set_model_state("idle")
+
+
+def schedule_prediction_worker_shutdown() -> None:
+    if MODEL_KEEPALIVE_SEC < 0:
+        return
+
+    with MODEL_STATE_LOCK:
+        if MODEL_UNLOAD_TIMER is not None:
+            MODEL_UNLOAD_TIMER.cancel()
+
+        timer = threading.Timer(MODEL_KEEPALIVE_SEC, stop_prediction_worker)
+        timer.daemon = True
+        globals()["MODEL_UNLOAD_TIMER"] = timer
+        timer.start()
+
+
+def ensure_prediction_worker_loaded(timeout_sec: float | None = None) -> PredictionWorkerHandle:
+    global PREDICTION_WORKER
+
+    timeout = timeout_sec if timeout_sec is not None else PREDICT_SUBPROCESS_TIMEOUT_SEC
+    with PREDICTION_WORKER_LOCK:
+        if PREDICTION_WORKER is not None and PREDICTION_WORKER.process.poll() is None:
+            return PREDICTION_WORKER
+
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--worker-serve",
+        ]
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        handle = PredictionWorkerHandle(process=process, messages=queue.Queue(), stderr_lines=[])
+        assert process.stdout is not None
+        assert process.stderr is not None
+        threading.Thread(
+            target=_worker_stdout_reader,
+            args=(process.stdout, handle.messages),
+            daemon=True,
+            name="prediction-worker-stdout",
+        ).start()
+        threading.Thread(
+            target=_worker_stderr_reader,
+            args=(process.stderr, handle.stderr_lines),
+            daemon=True,
+            name="prediction-worker-stderr",
+        ).start()
+        PREDICTION_WORKER = handle
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = max(0.1, deadline - time.monotonic())
+        if handle.process.poll() is not None:
+            stderr_output = _collect_worker_stderr(handle)
+            stop_prediction_worker()
+            raise RuntimeError(stderr_output or "Prediction worker exited before becoming ready.")
+        try:
+            message = handle.messages.get(timeout=min(1.0, remaining))
+        except queue.Empty:
+            continue
+        message_type = message.get("type")
+        if message_type == "ready":
+            set_model_state("ready")
+            return handle
+        if message_type == "error":
+            stop_prediction_worker()
+            raise RuntimeError(str(message.get("error") or "Prediction worker failed to start."))
+
+    stop_prediction_worker()
+    raise RuntimeError("Prediction worker startup timed out.")
+
+
+def warm_prediction_worker_async() -> None:
+    if not PREDICT_IN_SUBPROCESS:
+        return
+
+    status, _ = get_model_state()
+    if status in {"loading", "ready"}:
+        return
+
+    set_model_state("loading")
+
+    def _warm() -> None:
+        try:
+            ensure_prediction_worker_loaded()
+        except Exception as exc:
+            set_model_state("error", str(exc))
+            gc.collect()
+
+    threading.Thread(target=_warm, name="prediction-worker-warmup", daemon=True).start()
+
+
 def set_model_state(status: str, error: str = "") -> None:
     global MODEL_STATUS, MODEL_ERROR
     with MODEL_STATE_LOCK:
@@ -579,62 +736,95 @@ def predict_via_subprocess(
         input_path = temp_dir_path / f"input{suffix}"
         output_path = temp_dir_path / "result.json"
         input_path.write_bytes(raw_bytes)
+        handle = ensure_prediction_worker_loaded()
+        process = handle.process
+        if process.stdin is None:
+            raise RuntimeError("Prediction worker input stream is unavailable.")
 
-        command = [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            "--predict-once",
-            "--input",
-            str(input_path),
-            "--output",
-            str(output_path),
-            "--confidence",
-            str(confidence),
-            "--image-size",
-            str(image_size),
-        ]
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=PREDICT_SUBPROCESS_TIMEOUT_SEC,
-            check=False,
-        )
-        if result.returncode != 0:
-            message = (result.stderr or result.stdout or "").strip()
-            if not message:
-                message = f"Prediction worker exited with code {result.returncode}."
-            raise RuntimeError(message)
-        if not output_path.exists():
-            raise RuntimeError("Prediction worker did not produce an output payload.")
+        with PREDICTION_WORKER_LOCK:
+            process.stdin.write(
+                json.dumps(
+                    {
+                        "action": "predict",
+                        "input_path": str(input_path),
+                        "output_path": str(output_path),
+                        "confidence": confidence,
+                        "image_size": image_size,
+                    }
+                )
+                + "\n"
+            )
+            process.stdin.flush()
 
-        try:
-            return json.loads(output_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Prediction worker returned invalid JSON.") from exc
+            deadline = time.monotonic() + PREDICT_SUBPROCESS_TIMEOUT_SEC
+            while time.monotonic() < deadline:
+                remaining = max(0.1, deadline - time.monotonic())
+                if process.poll() is not None:
+                    stderr_output = _collect_worker_stderr(handle)
+                    stop_prediction_worker()
+                    raise RuntimeError(stderr_output or "Prediction worker exited unexpectedly.")
+                try:
+                    message = handle.messages.get(timeout=min(1.0, remaining))
+                except queue.Empty:
+                    continue
+
+                message_type = message.get("type")
+                if message_type == "result":
+                    if not bool(message.get("ok")):
+                        raise RuntimeError(str(message.get("error") or "Prediction worker failed."))
+                    if not output_path.exists():
+                        raise RuntimeError("Prediction worker did not produce an output payload.")
+                    schedule_prediction_worker_shutdown()
+                    try:
+                        return json.loads(output_path.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError("Prediction worker returned invalid JSON.") from exc
+                if message_type == "error":
+                    raise RuntimeError(str(message.get("error") or "Prediction worker failed."))
+
+        stop_prediction_worker()
+        raise RuntimeError("Prediction worker timed out while processing the request.")
 
 
-def run_prediction_worker(
-    input_path: str,
-    output_path: str,
-    confidence: float,
-    image_size: int,
-) -> int:
-    source_path = Path(input_path)
-    if not source_path.exists():
-        raise FileNotFoundError(f"Prediction input file not found: {source_path}")
+def run_prediction_worker_server() -> int:
+    try:
+        backend = load_model()
+        print(json.dumps({"type": "ready", "backend": backend.backend_name}), flush=True)
 
-    payload = predict_once_from_upload(
-        {
-            "filename": source_path.name,
-            "content": source_path.read_bytes(),
-        },
-        confidence=confidence,
-        image_size=image_size,
-    )
-    Path(output_path).write_text(json.dumps(payload), encoding="utf-8")
-    gc.collect()
-    return 0
+        for raw_line in sys.stdin:
+            line = raw_line.strip()
+            if not line:
+                continue
+            message = json.loads(line)
+            action = message.get("action")
+
+            if action == "shutdown":
+                print(json.dumps({"type": "shutdown", "ok": True}), flush=True)
+                break
+
+            if action != "predict":
+                print(json.dumps({"type": "error", "error": "Unsupported worker action."}), flush=True)
+                continue
+
+            input_path = Path(str(message["input_path"]))
+            output_path = Path(str(message["output_path"]))
+            payload = predict_once_from_upload(
+                {
+                    "filename": input_path.name,
+                    "content": input_path.read_bytes(),
+                },
+                confidence=clamp_float(str(message.get("confidence", "0.25")), 0.05, 0.95, 0.25),
+                image_size=clamp_int(str(message.get("image_size", "640")), 320, MAX_IMAGE_SIZE, 640),
+            )
+            output_path.write_text(json.dumps(payload), encoding="utf-8")
+            print(json.dumps({"type": "result", "ok": True}), flush=True)
+
+        gc.collect()
+        return 0
+    except Exception as exc:
+        print(json.dumps({"type": "error", "error": str(exc)}), flush=True)
+        gc.collect()
+        return 1
 
 
 class PCBRequestHandler(BaseHTTPRequestHandler):
@@ -665,6 +855,9 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             return
 
         if self.request_path == "/api/health":
+            if PREDICT_IN_SUBPROCESS and PREDICTION_WORKER is not None and PREDICTION_WORKER.process.poll() is not None:
+                stop_prediction_worker()
+                set_model_state("idle")
             model_status, model_error = get_model_state()
             self._send_json(
                 HTTPStatus.OK,
@@ -677,6 +870,23 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
                     "ready": model_status == "ready",
                     "prediction_mode": "subprocess" if PREDICT_IN_SUBPROCESS else "in_process",
                     "memory": get_memory_stats(),
+                },
+            )
+            return
+
+        if self.request_path == "/api/prepare":
+            if PREDICT_IN_SUBPROCESS:
+                warm_prediction_worker_async()
+            elif get_model_state()[0] == "idle":
+                warm_model()
+            model_status, model_error = get_model_state()
+            self._send_json(
+                HTTPStatus.ACCEPTED if model_status == "loading" else HTTPStatus.OK,
+                {
+                    "status": "ok",
+                    "model_status": model_status,
+                    "model_error": model_error,
+                    "ready": model_status == "ready",
                 },
             )
             return
@@ -715,6 +925,27 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             confidence = clamp_float(str(form.get("confidence", "0.25")), 0.05, 0.95, 0.25)
             image_size = clamp_int(str(form.get("image_size", "640")), 320, MAX_IMAGE_SIZE, 640)
             if PREDICT_IN_SUBPROCESS:
+                model_status, model_error = get_model_state()
+                if model_status == "idle":
+                    warm_prediction_worker_async()
+                    self._send_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": "Model is warming up. Please retry in a few seconds."},
+                    )
+                    return
+                if model_status == "loading":
+                    self._send_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": "Model is warming up. Please retry in a few seconds."},
+                    )
+                    return
+                if model_status == "error":
+                    warm_prediction_worker_async()
+                    self._send_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": model_error or "Model is restarting. Please retry in a few seconds."},
+                    )
+                    return
                 payload = predict_via_subprocess(
                     file_item=image_item,
                     confidence=confidence,
@@ -830,8 +1061,11 @@ def clamp_int(value: str, minimum: int, maximum: int, fallback: int) -> int:
 def run_server() -> None:
     host = os.getenv("PCB_BACKEND_HOST", DEFAULT_HOST)
     port = int(os.getenv("PORT", os.getenv("PCB_BACKEND_PORT", str(DEFAULT_PORT))))
-    if MODEL_WARM_ON_STARTUP and not PREDICT_IN_SUBPROCESS:
-        warm_model()
+    if MODEL_WARM_ON_STARTUP:
+        if PREDICT_IN_SUBPROCESS:
+            warm_prediction_worker_async()
+        else:
+            warm_model()
     server = RenderReadyThreadingHTTPServer((host, port), PCBRequestHandler)
     print(f"PCB defect backend listening on http://{host}:{port}")
     server.serve_forever()
@@ -839,25 +1073,12 @@ def run_server() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PCB defect backend")
-    parser.add_argument("--predict-once", action="store_true")
-    parser.add_argument("--input")
-    parser.add_argument("--output")
-    parser.add_argument("--confidence", type=float, default=0.25)
-    parser.add_argument("--image-size", type=int, default=640)
+    parser.add_argument("--worker-serve", action="store_true")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.predict_once:
-        if not args.input or not args.output:
-            raise SystemExit("--predict-once requires --input and --output")
-        raise SystemExit(
-            run_prediction_worker(
-                input_path=args.input,
-                output_path=args.output,
-                confidence=clamp_float(str(args.confidence), 0.05, 0.95, 0.25),
-                image_size=clamp_int(str(args.image_size), 320, MAX_IMAGE_SIZE, 640),
-            )
-        )
+    if args.worker_serve:
+        raise SystemExit(run_prediction_worker_server())
     run_server()
