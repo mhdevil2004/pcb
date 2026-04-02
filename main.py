@@ -5,6 +5,7 @@ import gc
 import json
 import os
 import importlib
+import socket
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ import sys
 from pathlib import Path
 import threading
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -38,6 +40,12 @@ MAX_DETECTIONS = int(os.getenv("MAX_DETECTIONS", "60"))
 ANNOTATION_WIDTH = int(os.getenv("ANNOTATION_WIDTH", "2"))
 MAX_RESPONSE_IMAGE_EDGE = int(os.getenv("MAX_RESPONSE_IMAGE_EDGE", "800"))
 RESPONSE_JPEG_QUALITY = int(os.getenv("RESPONSE_JPEG_QUALITY", "60"))
+SERVER_REQUEST_TIMEOUT_SEC = float(os.getenv("SERVER_REQUEST_TIMEOUT_SEC", "30"))
+MODEL_WARM_ON_STARTUP = os.getenv("MODEL_WARM_ON_STARTUP", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
 DEFAULT_CLASS_LABELS = {
     0: "open",
     1: "short",
@@ -61,6 +69,7 @@ MODEL_STATE_LOCK = threading.Lock()
 PREDICT_SEMAPHORE = threading.BoundedSemaphore(max(1, PREDICT_CONCURRENCY))
 MODEL_STATUS = "idle"
 MODEL_ERROR = ""
+MODEL_WARM_THREAD: threading.Thread | None = None
 
 
 @dataclass
@@ -339,6 +348,8 @@ def get_model_state() -> tuple[str, str]:
 
 
 def warm_model() -> None:
+    global MODEL_WARM_THREAD
+
     status, _ = get_model_state()
     if status in {"loading", "ready"}:
         return
@@ -352,7 +363,8 @@ def warm_model() -> None:
         except Exception as exc:
             set_model_state("error", str(exc))
 
-    threading.Thread(target=_load, daemon=True).start()
+    MODEL_WARM_THREAD = threading.Thread(target=_load, name="model-warmup", daemon=True)
+    MODEL_WARM_THREAD.start()
 
 
 def image_to_data_url(image: Image.Image) -> str:
@@ -408,7 +420,9 @@ def parse_uploaded_image(file_item: dict[str, Any]) -> Image.Image:
     if not raw_bytes:
         raise ValueError("Uploaded file is empty.")
 
-    image = Image.open(BytesIO(raw_bytes)).convert("RGB")
+    source_image = Image.open(BytesIO(raw_bytes))
+    image = source_image.convert("RGB")
+    source_image.close()
     if image.width * image.height > MAX_INPUT_PIXELS or max(image.size) > MAX_IMAGE_EDGE:
         image.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE), Image.Resampling.LANCZOS)
     return image
@@ -465,35 +479,55 @@ def build_prediction_response(
 
 class PCBRequestHandler(BaseHTTPRequestHandler):
     server_version = "PCBDefectServer/1.0"
+    protocol_version = "HTTP/1.1"
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(SERVER_REQUEST_TIMEOUT_SEC)
+
+    @property
+    def request_path(self) -> str:
+        return urlparse(self.path).path
 
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
         self._send_cors_headers()
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
         self.end_headers()
 
+    def do_HEAD(self) -> None:
+        self._send_status_only(HTTPStatus.OK)
+
     def do_GET(self) -> None:
-        if self.path == "/":
+        if self.request_path == "/":
+            self._ensure_model_warm()
             self._send_json(HTTPStatus.OK, {"status": "ok", "service": "pcb-defect-backend"})
             return
 
-        if self.path == "/api/health":
+        if self.request_path == "/api/health":
+            self._ensure_model_warm()
             model_status, model_error = get_model_state()
             self._send_json(
                 HTTPStatus.OK,
                 {
                     "status": "ok",
+                    "service": "pcb-defect-backend",
                     "model_path": str(MODEL_PATH),
                     "model_status": model_status,
                     "model_error": model_error,
+                    "ready": model_status == "ready",
                 },
             )
             return
 
-        if self.path == "/api/classes":
+        if self.request_path == "/api/classes":
+            self._ensure_model_warm()
             self._send_json(
                 HTTPStatus.OK,
                 {
                     "backend": "unloaded",
+                    "model_status": get_model_state()[0],
                     "classes": list(DEFAULT_CLASS_LABELS.values()),
                 },
             )
@@ -502,7 +536,7 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found."})
 
     def do_POST(self) -> None:
-        if self.path != "/api/predict":
+        if self.request_path != "/api/predict":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found."})
             return
 
@@ -540,12 +574,15 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             confidence = clamp_float(str(form.get("confidence", "0.25")), 0.05, 0.95, 0.25)
             image_size = clamp_int(str(form.get("image_size", "640")), 320, MAX_IMAGE_SIZE, 640)
             image = parse_uploaded_image(image_item)
-            payload = build_prediction_response(
-                backend=backend,
-                image=image,
-                confidence=confidence,
-                image_size=image_size,
-            )
+            try:
+                payload = build_prediction_response(
+                    backend=backend,
+                    image=image,
+                    confidence=confidence,
+                    image_size=image_size,
+                )
+            finally:
+                image.close()
             self._send_json(HTTPStatus.OK, payload)
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -580,8 +617,19 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
         self._send_cors_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            return
+
+    def _send_status_only(self, status: HTTPStatus) -> None:
+        self.send_response(status)
+        self._send_cors_headers()
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
 
     def _send_cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -591,8 +639,19 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             "Content-Type, Accept, Origin, X-Requested-With, Authorization",
         )
 
+    def _ensure_model_warm(self) -> None:
+        status, _ = get_model_state()
+        if status == "idle":
+            warm_model()
+
     def log_message(self, format: str, *args: Any) -> None:
         return
+
+
+class RenderReadyThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 32
 
 
 def clamp_float(value: str, minimum: float, maximum: float, fallback: float) -> float:
@@ -614,7 +673,9 @@ def clamp_int(value: str, minimum: int, maximum: int, fallback: int) -> int:
 def run_server() -> None:
     host = os.getenv("PCB_BACKEND_HOST", DEFAULT_HOST)
     port = int(os.getenv("PORT", os.getenv("PCB_BACKEND_PORT", str(DEFAULT_PORT))))
-    server = ThreadingHTTPServer((host, port), PCBRequestHandler)
+    if MODEL_WARM_ON_STARTUP:
+        warm_model()
+    server = RenderReadyThreadingHTTPServer((host, port), PCBRequestHandler)
     print(f"PCB defect backend listening on http://{host}:{port}")
     server.serve_forever()
 
