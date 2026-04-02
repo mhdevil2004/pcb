@@ -47,13 +47,14 @@ ANNOTATION_WIDTH = int(os.getenv("ANNOTATION_WIDTH", "2"))
 MAX_RESPONSE_IMAGE_EDGE = int(os.getenv("MAX_RESPONSE_IMAGE_EDGE", "800"))
 RESPONSE_JPEG_QUALITY = int(os.getenv("RESPONSE_JPEG_QUALITY", "60"))
 SERVER_REQUEST_TIMEOUT_SEC = float(os.getenv("SERVER_REQUEST_TIMEOUT_SEC", "30"))
+MODEL_READY_TIMEOUT_SEC = float(os.getenv("MODEL_READY_TIMEOUT_SEC", "180"))
 MODEL_WARM_ON_STARTUP = os.getenv("MODEL_WARM_ON_STARTUP", "false").strip().lower() not in {
     "0",
     "false",
     "no",
 }
 MODEL_KEEPALIVE_SEC = float(os.getenv("MODEL_KEEPALIVE_SEC", "0"))
-PREDICT_IN_SUBPROCESS = os.getenv("PREDICT_IN_SUBPROCESS", "true").strip().lower() not in {
+PREDICT_IN_SUBPROCESS = os.getenv("PREDICT_IN_SUBPROCESS", "false").strip().lower() not in {
     "0",
     "false",
     "no",
@@ -79,6 +80,7 @@ DETECTION_COLUMNS = [
 ]
 MODEL_LOCK = threading.Lock()
 MODEL_STATE_LOCK = threading.Lock()
+MODEL_STATE_CONDITION = threading.Condition(MODEL_STATE_LOCK)
 PREDICT_SEMAPHORE = threading.BoundedSemaphore(max(1, PREDICT_CONCURRENCY))
 MODEL_STATUS = "idle"
 MODEL_ERROR = ""
@@ -566,14 +568,50 @@ def warm_prediction_worker_async() -> None:
 
 def set_model_state(status: str, error: str = "") -> None:
     global MODEL_STATUS, MODEL_ERROR
-    with MODEL_STATE_LOCK:
+    with MODEL_STATE_CONDITION:
         MODEL_STATUS = status
         MODEL_ERROR = error
+        MODEL_STATE_CONDITION.notify_all()
 
 
 def get_model_state() -> tuple[str, str]:
     with MODEL_STATE_LOCK:
         return MODEL_STATUS, MODEL_ERROR
+
+
+def ensure_model_ready(timeout_sec: float | None = None) -> ModelBackend:
+    timeout = timeout_sec if timeout_sec is not None else MODEL_READY_TIMEOUT_SEC
+    deadline = time.monotonic() + timeout
+    should_load = False
+
+    with MODEL_STATE_CONDITION:
+        while True:
+            if MODEL_STATUS == "ready":
+                return load_model()
+            if MODEL_STATUS == "error":
+                raise RuntimeError(MODEL_ERROR or "Model failed to load.")
+            if MODEL_STATUS == "idle":
+                MODEL_STATUS = "loading"
+                MODEL_ERROR = ""
+                should_load = True
+                break
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Model warm-up timed out.")
+            MODEL_STATE_CONDITION.wait(timeout=remaining)
+
+    if should_load:
+        try:
+            backend = load_model()
+        except Exception as exc:
+            set_model_state("error", str(exc))
+            gc.collect()
+            raise
+        set_model_state("ready")
+        return backend
+
+    raise RuntimeError("Model readiness check failed.")
 
 
 def warm_model() -> None:
@@ -583,12 +621,9 @@ def warm_model() -> None:
     if status in {"loading", "ready"}:
         return
 
-    set_model_state("loading")
-
     def _load() -> None:
         try:
-            load_model()
-            set_model_state("ready")
+            ensure_model_ready()
         except Exception as exc:
             set_model_state("error", str(exc))
             gc.collect()
@@ -731,9 +766,27 @@ def build_prediction_response(
 
 
 def predict_once_from_upload(file_item: dict[str, Any], confidence: float, image_size: int) -> dict[str, Any]:
+    backend = ensure_model_ready()
     image = parse_uploaded_image(file_item)
     try:
-        backend = load_model()
+        return build_prediction_response(
+            backend=backend,
+            image=image,
+            confidence=confidence,
+            image_size=image_size,
+        )
+    finally:
+        image.close()
+
+
+def predict_with_ready_backend(
+    backend: ModelBackend,
+    file_item: dict[str, Any],
+    confidence: float,
+    image_size: int,
+) -> dict[str, Any]:
+    image = parse_uploaded_image(file_item)
+    try:
         return build_prediction_response(
             backend=backend,
             image=image,
@@ -888,9 +941,6 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             return
 
         if self.request_path == "/api/health":
-            if PREDICT_IN_SUBPROCESS and PREDICTION_WORKER is not None and PREDICTION_WORKER.process.poll() is not None:
-                stop_prediction_worker()
-                set_model_state("idle")
             model_status, model_error = get_model_state()
             self._send_json(
                 HTTPStatus.OK,
@@ -908,9 +958,7 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             return
 
         if self.request_path == "/api/prepare":
-            if PREDICT_IN_SUBPROCESS:
-                warm_prediction_worker_async()
-            elif get_model_state()[0] == "idle":
+            if get_model_state()[0] == "idle":
                 warm_model()
             model_status, model_error = get_model_state()
             self._send_json(
@@ -957,64 +1005,27 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
 
             confidence = clamp_float(str(form.get("confidence", "0.25")), 0.05, 0.95, 0.25)
             image_size = clamp_int(str(form.get("image_size", "640")), 320, MAX_IMAGE_SIZE, 640)
-            if PREDICT_IN_SUBPROCESS:
-                model_status, model_error = get_model_state()
-                if model_status == "idle":
-                    warm_prediction_worker_async()
-                    self._send_json(
-                        HTTPStatus.SERVICE_UNAVAILABLE,
-                        {"error": "Model is warming up. Please retry in a few seconds."},
-                    )
-                    return
-                if model_status == "loading":
-                    self._send_json(
-                        HTTPStatus.SERVICE_UNAVAILABLE,
-                        {"error": "Model is warming up. Please retry in a few seconds."},
-                    )
-                    return
-                if model_status == "error":
-                    warm_prediction_worker_async()
-                    self._send_json(
-                        HTTPStatus.SERVICE_UNAVAILABLE,
-                        {"error": model_error or "Model is restarting. Please retry in a few seconds."},
-                    )
-                    return
-                payload = predict_via_subprocess(
-                    file_item=image_item,
-                    confidence=confidence,
-                    image_size=image_size,
-                )
-            else:
-                model_status, model_error = get_model_state()
-                if model_status == "loading":
-                    self._send_json(
-                        HTTPStatus.SERVICE_UNAVAILABLE,
-                        {"error": "Model is warming up. Please retry in a minute."},
-                    )
-                    return
-                if model_status == "error":
-                    raise RuntimeError(model_error or "Model failed to load.")
-                if model_status == "idle":
-                    warm_model()
-                    self._send_json(
-                        HTTPStatus.SERVICE_UNAVAILABLE,
-                        {"error": "Model is warming up. Please retry in a minute."},
-                    )
-                    return
-                payload = predict_once_from_upload(
-                    file_item=image_item,
-                    confidence=confidence,
-                    image_size=image_size,
-                )
-                schedule_model_unload()
+            model_status, _ = get_model_state()
+            if model_status == "error":
+                unload_model()
+
+            backend = ensure_model_ready()
+            payload = predict_with_ready_backend(
+                backend=backend,
+                file_item=image_item,
+                confidence=confidence,
+                image_size=image_size,
+            )
+            schedule_model_unload()
             self._send_json(HTTPStatus.OK, payload)
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except TimeoutError as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
         except FileNotFoundError as exc:
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         except Exception as exc:
-            if not PREDICT_IN_SUBPROCESS:
-                schedule_model_unload()
+            schedule_model_unload()
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         finally:
             gc.collect()
