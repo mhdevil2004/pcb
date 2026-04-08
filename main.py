@@ -60,6 +60,7 @@ PREDICT_IN_SUBPROCESS = os.getenv("PREDICT_IN_SUBPROCESS", "false").strip().lowe
     "no",
 }
 PREDICT_SUBPROCESS_TIMEOUT_SEC = float(os.getenv("PREDICT_SUBPROCESS_TIMEOUT_SEC", "240"))
+PREFERRED_MODEL_RUNTIME = os.getenv("PREFERRED_MODEL_RUNTIME", "local").strip().lower()
 DEFAULT_CLASS_LABELS = {
     0: "open",
     1: "short",
@@ -275,8 +276,8 @@ class ModelBackend:
         )
 
 
-def empty_detections() -> list[dict[str, Any]]:
-    return []
+def empty_detections() -> list[dict[str, Any]]:   
+    return []  
 
 
 def normalize_class_labels(names: Any) -> dict[int, str]:
@@ -397,6 +398,20 @@ def load_with_torch_hub(model_path: Path) -> ModelBackend:
 def load_model() -> ModelBackend:
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+
+    if PREFERRED_MODEL_RUNTIME in {"local", "yolov5_local"} and LOCAL_YOLOV5_REPO.exists():
+        return load_with_local_yolov5(MODEL_PATH)
+
+    if PREFERRED_MODEL_RUNTIME in {"ultralytics", "auto"}:
+        try:
+            return load_with_ultralytics(MODEL_PATH)
+        except Exception as exc:
+            if not is_yolov5_incompatibility(exc):
+                raise
+            return load_with_torch_hub(MODEL_PATH)
+
+    if PREFERRED_MODEL_RUNTIME in {"torch_hub", "hub", "yolov5"}:
+        return load_with_torch_hub(MODEL_PATH)
 
     if LOCAL_YOLOV5_REPO.exists():
         return load_with_local_yolov5(MODEL_PATH)
@@ -959,7 +974,10 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
 
         if self.request_path == "/api/prepare":
             if get_model_state()[0] == "idle":
-                warm_model()
+                if PREDICT_IN_SUBPROCESS:
+                    warm_prediction_worker_async()
+                else:
+                    warm_model()
             model_status, model_error = get_model_state()
             self._send_json(
                 HTTPStatus.ACCEPTED if model_status == "loading" else HTTPStatus.OK,
@@ -1007,16 +1025,27 @@ class PCBRequestHandler(BaseHTTPRequestHandler):
             image_size = clamp_int(str(form.get("image_size", "640")), 320, MAX_IMAGE_SIZE, 640)
             model_status, _ = get_model_state()
             if model_status == "error":
-                unload_model()
+                if PREDICT_IN_SUBPROCESS:
+                    stop_prediction_worker()
+                else:
+                    unload_model()
 
-            backend = ensure_model_ready()
-            payload = predict_with_ready_backend(
-                backend=backend,
-                file_item=image_item,
-                confidence=confidence,
-                image_size=image_size,
-            )
-            schedule_model_unload()
+            if PREDICT_IN_SUBPROCESS:
+                ensure_prediction_worker_loaded()
+                payload = predict_via_subprocess(
+                    file_item=image_item,
+                    confidence=confidence,
+                    image_size=image_size,
+                )
+            else:
+                backend = ensure_model_ready()
+                payload = predict_with_ready_backend(
+                    backend=backend,
+                    file_item=image_item,
+                    confidence=confidence,
+                    image_size=image_size,
+                )
+                schedule_model_unload()
             self._send_json(HTTPStatus.OK, payload)
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
