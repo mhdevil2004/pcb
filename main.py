@@ -47,19 +47,19 @@ ANNOTATION_WIDTH = int(os.getenv("ANNOTATION_WIDTH", "2"))
 MAX_RESPONSE_IMAGE_EDGE = int(os.getenv("MAX_RESPONSE_IMAGE_EDGE", "800"))
 RESPONSE_JPEG_QUALITY = int(os.getenv("RESPONSE_JPEG_QUALITY", "60"))
 SERVER_REQUEST_TIMEOUT_SEC = float(os.getenv("SERVER_REQUEST_TIMEOUT_SEC", "30"))
-MODEL_READY_TIMEOUT_SEC = float(os.getenv("MODEL_READY_TIMEOUT_SEC", "180"))
+MODEL_READY_TIMEOUT_SEC = float(os.getenv("MODEL_READY_TIMEOUT_SEC", "300"))
 MODEL_WARM_ON_STARTUP = os.getenv("MODEL_WARM_ON_STARTUP", "false").strip().lower() not in {
     "0",
     "false",
     "no",
 }
 MODEL_KEEPALIVE_SEC = float(os.getenv("MODEL_KEEPALIVE_SEC", "0"))
-PREDICT_IN_SUBPROCESS = os.getenv("PREDICT_IN_SUBPROCESS", "false").strip().lower() not in {
+PREDICT_IN_SUBPROCESS = os.getenv("PREDICT_IN_SUBPROCESS", "true").strip().lower() not in {
     "0",
     "false",
     "no",
 }
-PREDICT_SUBPROCESS_TIMEOUT_SEC = float(os.getenv("PREDICT_SUBPROCESS_TIMEOUT_SEC", "240"))
+PREDICT_SUBPROCESS_TIMEOUT_SEC = float(os.getenv("PREDICT_SUBPROCESS_TIMEOUT_SEC", "480"))
 PREFERRED_MODEL_RUNTIME = os.getenv("PREFERRED_MODEL_RUNTIME", "local").strip().lower()
 DEFAULT_CLASS_LABELS = {
     0: "open",
