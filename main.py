@@ -31,6 +31,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 import psutil
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 MODEL_PATH = Path(__file__).with_name("pcb_defect_detector.pt")
 LOCAL_YOLOV5_REPO = Path(__file__).with_name("yolov5")
 DEFAULT_HOST = "0.0.0.0"
@@ -61,6 +64,11 @@ PREDICT_IN_SUBPROCESS = os.getenv("PREDICT_IN_SUBPROCESS", "true").strip().lower
 }
 PREDICT_SUBPROCESS_TIMEOUT_SEC = float(os.getenv("PREDICT_SUBPROCESS_TIMEOUT_SEC", "480"))
 PREFERRED_MODEL_RUNTIME = os.getenv("PREFERRED_MODEL_RUNTIME", "local").strip().lower()
+INCLUDE_ANNOTATED_IMAGE = os.getenv("INCLUDE_ANNOTATED_IMAGE", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
 DEFAULT_CLASS_LABELS = {
     0: "open",
     1: "short",
@@ -94,7 +102,6 @@ PREDICTION_WORKER: PredictionWorkerHandle | None = None
 @dataclass
 class PredictionOutput:
     detections: list[dict[str, Any]]
-    annotated_image: Image.Image
 
 
 @dataclass
@@ -173,7 +180,7 @@ class ModelBackend:
         self, image: Image.Image, confidence: float, image_size: int
     ) -> PredictionOutput:
         results = self.model.predict(
-            source=np.array(image),
+            source=np.asarray(image),
             conf=confidence,
             imgsz=image_size,
             verbose=False,
@@ -191,10 +198,7 @@ class ModelBackend:
                 class_labels=self.class_labels,
             )
 
-        return PredictionOutput(
-            detections=detections,
-            annotated_image=annotate_image(image, detections),
-        )
+        return PredictionOutput(detections=detections)
 
     def _predict_yolov5(
         self, image: Image.Image, confidence: float, image_size: int
@@ -205,7 +209,7 @@ class ModelBackend:
         self.model.multi_label = False
         self.model.max_det = MAX_DETECTIONS
 
-        results = self.model(np.array(image), size=image_size)
+        results = self.model(np.asarray(image), size=image_size)
         raw = results.xyxy[0]
         if raw is None or len(raw) == 0:
             detections = empty_detections()
@@ -218,36 +222,26 @@ class ModelBackend:
                 class_labels=self.class_labels,
             )
 
-        return PredictionOutput(
-            detections=detections,
-            annotated_image=annotate_image(image, detections),
-        )
+        return PredictionOutput(detections=detections)
 
     def _predict_yolov5_local(
         self, image: Image.Image, confidence: float, image_size: int
     ) -> PredictionOutput:
         import torch
 
-        letterbox = importlib.import_module("utils.augmentations").letterbox
-        general_utils = importlib.import_module("utils.general")
-        non_max_suppression = general_utils.non_max_suppression
-        scale_boxes = general_utils.scale_boxes
-
-        image_np = np.array(image)
+        image_np = np.asarray(image)
         stride = int(getattr(self.model, "stride", torch.tensor([32])).max())
-        processed, _, _ = letterbox(image_np, new_shape=image_size, auto=False, stride=stride)
+        processed, ratio, pad = letterbox_image(image_np, new_shape=image_size, auto=False, stride=stride)
         processed = np.ascontiguousarray(processed.transpose((2, 0, 1)))
-
-        tensor = torch.from_numpy(processed).to(next(self.model.parameters()).device)
-        tensor = tensor.float() / 255.0
-        if tensor.ndim == 3:
-            tensor = tensor.unsqueeze(0)
+        device = next(self.model.parameters()).device
+        tensor = torch.from_numpy(processed).unsqueeze(0).to(device=device, dtype=torch.float32)
+        tensor.div_(255.0)
 
         with torch.inference_mode():
             raw_predictions = self.model(tensor)
             if isinstance(raw_predictions, (list, tuple)):
                 raw_predictions = raw_predictions[0]
-            predictions = non_max_suppression(
+            predictions = single_image_non_max_suppression(
                 raw_predictions,
                 conf_thres=confidence,
                 iou_thres=0.45,
@@ -258,10 +252,12 @@ class ModelBackend:
         if detections_tensor is None or len(detections_tensor) == 0:
             detections = empty_detections()
         else:
-            detections_tensor[:, :4] = scale_boxes(
-                tensor.shape[2:],
+            detections_tensor[:, :4] = scale_boxes_to_original(
                 detections_tensor[:, :4],
-                image_np.shape,
+                image_shape=image_np.shape[:2],
+                resized_shape=tensor.shape[2:],
+                ratio=ratio,
+                pad=pad,
             ).round()
             detections = build_detection_frame(
                 xyxy=detections_tensor[:, :4].cpu().numpy(),
@@ -270,10 +266,8 @@ class ModelBackend:
                 class_labels=self.class_labels,
             )
 
-        return PredictionOutput(
-            detections=detections,
-            annotated_image=annotate_image(image, detections),
-        )
+        del tensor, processed, raw_predictions, predictions
+        return PredictionOutput(detections=detections)
 
 
 def empty_detections() -> list[dict[str, Any]]:   
@@ -332,6 +326,8 @@ def load_with_ultralytics(model_path: Path) -> ModelBackend:
     from ultralytics import YOLO
 
     model = YOLO(str(model_path))
+    model.model.eval()
+    model.model.requires_grad_(False)
     names = getattr(model.model, "names", None)
     return ModelBackend("ultralytics", model, normalize_class_labels(names))
 
@@ -348,6 +344,8 @@ def load_with_local_yolov5(model_path: Path) -> ModelBackend:
     with windows_checkpoint_compatibility():
         model = attempt_load(str(model_path), device=torch.device("cpu"), inplace=True, fuse=True)
 
+    model.eval()
+    model.requires_grad_(False)
     names = getattr(model, "names", None)
     return ModelBackend("yolov5_local", model, normalize_class_labels(names))
 
@@ -390,6 +388,8 @@ def load_with_torch_hub(model_path: Path) -> ModelBackend:
         else:
             os.environ["YOLOv5_AUTOINSTALL"] = previous_autoinstall
 
+    model.eval()
+    model.requires_grad_(False)
     names = getattr(model, "names", None)
     return ModelBackend("yolov5", model, normalize_class_labels(names))
 
@@ -666,15 +666,150 @@ def image_to_data_url(image: Image.Image) -> str:
     return f"data:image/jpeg;base64,{encoded}"
 
 
-def annotate_image(image: Image.Image, detections: list[dict[str, Any]]) -> Image.Image:
-    annotated = image.copy()
-    draw = ImageDraw.Draw(annotated)
+def render_annotated_image_data_url(image: Image.Image, detections: list[dict[str, Any]]) -> str:
+    if not INCLUDE_ANNOTATED_IMAGE:
+        return ""
+
+    preview = image.copy()
+    if max(preview.size) > MAX_RESPONSE_IMAGE_EDGE:
+        preview.thumbnail((MAX_RESPONSE_IMAGE_EDGE, MAX_RESPONSE_IMAGE_EDGE), Image.Resampling.LANCZOS)
+
+    scale_x = preview.width / image.width if image.width else 1.0
+    scale_y = preview.height / image.height if image.height else 1.0
+    draw = ImageDraw.Draw(preview)
     for row in detections:
-        box = [row["x1"], row["y1"], row["x2"], row["y2"]]
+        box = [
+            row["x1"] * scale_x,
+            row["y1"] * scale_y,
+            row["x2"] * scale_x,
+            row["y2"] * scale_y,
+        ]
         label = f'{row["class_name"]} {row["confidence"]:.2f}'
         draw.rectangle(box, outline="red", width=ANNOTATION_WIDTH)
-        draw.text((row["x1"] + 4, max(0, row["y1"] - 14)), label, fill="red")
-    return annotated
+        draw.text((box[0] + 4, max(0, box[1] - 14)), label, fill="red")
+
+    try:
+        return image_to_data_url(preview)
+    finally:
+        preview.close()
+
+
+def letterbox_image(
+    image: np.ndarray,
+    new_shape: int | tuple[int, int] = 640,
+    color: tuple[int, int, int] = (114, 114, 114),
+    auto: bool = False,
+    scaleup: bool = True,
+    stride: int = 32,
+) -> tuple[np.ndarray, tuple[float, float], tuple[float, float]]:
+    import cv2
+
+    shape = image.shape[:2]
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+
+    ratio = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    if not scaleup:
+        ratio = min(ratio, 1.0)
+
+    new_unpad = (int(round(shape[1] * ratio)), int(round(shape[0] * ratio)))
+    dw = new_shape[1] - new_unpad[0]
+    dh = new_shape[0] - new_unpad[1]
+    if auto:
+        dw %= stride
+        dh %= stride
+
+    dw /= 2
+    dh /= 2
+
+    if shape[::-1] != new_unpad:
+        image = cv2.resize(image, new_unpad, interpolation=cv2.INTER_LINEAR)
+
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return image, (ratio, ratio), (dw, dh)
+
+
+def xywh_to_xyxy(boxes: Any) -> Any:
+    converted = boxes.clone()
+    converted[:, 0] = boxes[:, 0] - boxes[:, 2] / 2
+    converted[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
+    converted[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
+    converted[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
+    return converted
+
+
+def single_image_non_max_suppression(
+    prediction: Any,
+    conf_thres: float,
+    iou_thres: float,
+    max_det: int,
+) -> list[Any]:
+    import torch
+    from torchvision.ops import nms
+
+    if prediction.ndim == 2:
+        prediction = prediction.unsqueeze(0)
+
+    outputs: list[Any] = []
+    for image_prediction in prediction:
+        if image_prediction.numel() == 0:
+            outputs.append(torch.empty((0, 6), device=image_prediction.device))
+            continue
+
+        candidates = image_prediction[image_prediction[:, 4] > conf_thres]
+        if candidates.numel() == 0:
+            outputs.append(torch.empty((0, 6), device=image_prediction.device))
+            continue
+
+        candidates = candidates.clone()
+        candidates[:, 5:] *= candidates[:, 4:5]
+        confidences, class_ids = candidates[:, 5:].max(1)
+        keep = confidences > conf_thres
+        if not torch.any(keep):
+            outputs.append(torch.empty((0, 6), device=image_prediction.device))
+            continue
+
+        boxes = xywh_to_xyxy(candidates[:, :4][keep])
+        confidences = confidences[keep]
+        class_ids = class_ids[keep].to(boxes.dtype)
+        kept_indices = nms(boxes, confidences, iou_thres)[:max_det]
+        outputs.append(
+            torch.cat(
+                (
+                    boxes[kept_indices],
+                    confidences[kept_indices].unsqueeze(1),
+                    class_ids[kept_indices].unsqueeze(1),
+                ),
+                dim=1,
+            )
+        )
+
+    return outputs
+
+
+def scale_boxes_to_original(
+    boxes: Any,
+    image_shape: tuple[int, int],
+    resized_shape: tuple[int, int],
+    ratio: tuple[float, float],
+    pad: tuple[float, float],
+) -> Any:
+    gain = ratio[0] if ratio[0] else min(
+        resized_shape[0] / image_shape[0],
+        resized_shape[1] / image_shape[1],
+    )
+    pad_x, pad_y = pad
+
+    boxes[:, [0, 2]] -= pad_x
+    boxes[:, [1, 3]] -= pad_y
+    boxes[:, :4] /= gain
+    boxes[:, 0].clamp_(0, image_shape[1])
+    boxes[:, 1].clamp_(0, image_shape[0])
+    boxes[:, 2].clamp_(0, image_shape[1])
+    boxes[:, 3].clamp_(0, image_shape[0])
+    return boxes
 
 
 def summarize_detections(detections: list[dict[str, Any]]) -> dict[str, Any]:
@@ -767,19 +902,17 @@ def build_prediction_response(
     image_size: int,
 ) -> dict[str, Any]:
     prediction = backend.predict(image=image, confidence=confidence, image_size=image_size)
-    try:
-        detections = prediction.detections
-        summary = summarize_detections(detections)
+    detections = prediction.detections
+    summary = summarize_detections(detections)
 
-        return {
-            "backend": backend.backend_name,
-            "classes": list(backend.class_labels.values()),
-            "summary": summary,
-            "detections": detections,
-            "annotated_image": image_to_data_url(prediction.annotated_image),
-        }
-    finally:
-        prediction.annotated_image.close()
+    return {
+        "backend": backend.backend_name,
+        "classes": list(backend.class_labels.values()),
+        "summary": summary,
+        "detections": detections,
+        # Render the preview-sized overlay directly to avoid holding a second full-resolution image in RAM.
+        "annotated_image": render_annotated_image_data_url(image, detections),
+    }
 
 
 def predict_once_from_upload(file_item: dict[str, Any], confidence: float, image_size: int) -> dict[str, Any]:
