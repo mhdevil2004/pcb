@@ -12,9 +12,11 @@ services:
       - key: MODEL_WARM_ON_STARTUP
         value: "false"
       - key: MODEL_KEEPALIVE_SEC
-        value: "180"
+        value: "0"
       - key: PREDICT_IN_SUBPROCESS
-        value: "false"
+        value: "true"
+      - key: PREFERRED_MODEL_RUNTIME
+        value: "local"
       - key: PREDICT_SUBPROCESS_TIMEOUT_SEC
         value: "480"
       - key: SERVER_REQUEST_TIMEOUT_SEC
