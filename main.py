@@ -595,6 +595,8 @@ def get_model_state() -> tuple[str, str]:
 
 
 def ensure_model_ready(timeout_sec: float | None = None) -> ModelBackend:
+    global MODEL_STATUS, MODEL_ERROR
+
     timeout = timeout_sec if timeout_sec is not None else MODEL_READY_TIMEOUT_SEC
     deadline = time.monotonic() + timeout
     should_load = False
