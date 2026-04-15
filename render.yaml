@@ -3,41 +3,51 @@ services:
     name: pcb-defect-backend
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install --no-cache-dir torch==2.0.1 --index-url https://download.pytorch.org/whl/cpu
+      pip install --no-cache-dir ultralytics==8.0.150 numpy==1.24.3 Pillow==10.0.0 opencv-python-headless==4.8.0.74 psutil==5.9.5
+      rm -rf /root/.cache/pip
+      rm -rf ~/.cache/torch
     startCommand: python -u main.py
     healthCheckPath: /api/health
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.0"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      
+      # Ultra-aggressive memory settings
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
       - key: MODEL_WARM_ON_STARTUP
         value: "false"
       - key: MODEL_KEEPALIVE_SEC
-        value: "0"
+        value: "60"       # Unload after 1 minute idle
       - key: PREDICT_IN_SUBPROCESS
-        value: "true"
+        value: "false"
       - key: PREFERRED_MODEL_RUNTIME
-        value: "local"
-      - key: PREDICT_SUBPROCESS_TIMEOUT_SEC
-        value: "480"
-      - key: SERVER_REQUEST_TIMEOUT_SEC
-        value: "300"
-      - key: MODEL_READY_TIMEOUT_SEC
-        value: "240"
-      - key: YOLO_CONFIG_DIR
-        value: "/tmp/Ultralytics"
+        value: "ultralytics"
+      
+      # Minimal image sizes
       - key: MAX_UPLOAD_BYTES
-        value: "8388608"
+        value: "2097152"  # 2MB
       - key: MAX_INPUT_PIXELS
-        value: "4000000"
+        value: "640000"   # 0.64MP (800x800)
       - key: MAX_IMAGE_EDGE
-        value: "768"
-      - key: MAX_IMAGE_SIZE
         value: "512"
-      - key: PREDICT_CONCURRENCY
-        value: "1"
+      - key: MAX_IMAGE_SIZE
+        value: "320"      # Smallest reasonable model input
       - key: MAX_DETECTIONS
-        value: "60"
+        value: "20"
       - key: MAX_RESPONSE_IMAGE_EDGE
-        value: "640"
+        value: "320"
       - key: RESPONSE_JPEG_QUALITY
-        value: "50"
+        value: "30"
+      
+      # Cache in /tmp
+      - key: YOLO_CONFIG_DIR
+        value: "/tmp/yolo"
+      - key: TORCH_HOME
+        value: "/tmp/torch"
